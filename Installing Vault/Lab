@@ -1,0 +1,237 @@
+Installing Vault
+Lab Objectives
+By the end of this lab, you will be able to:
+
+Install HashiCorp Vault on a Linux server
+Configure Vault for standalone operation
+Verify the installation using the Vault CLI
+Understand basic Vault architecture and components
+Initialize and unseal a Vault instance
+Prerequisites
+Before starting this lab, you should have:
+
+Basic knowledge of Linux command line operations
+Understanding of file permissions and directory structures
+Familiarity with text editors like nano or vim
+Basic understanding of security concepts like encryption and secrets management
+Lab Environment
+Al Nafi provides Linux-based cloud machines for this lab. Simply click Start Lab to access your dedicated Linux machine. The provided Linux machine is bare metal with no pre-installed tools, so you will need to install Vault and any required dependencies during this lab exercise.
+
+Task 1: Install Vault on a Linux Server
+Subtask 1.1: Update System Packages
+First, ensure your Linux system is up to date with the latest packages.
+
+sudo apt update && sudo apt upgrade -y
+Subtask 1.2: Install Required Dependencies
+Install essential tools needed for the Vault installation process.
+
+sudo apt install -y wget curl unzip gpg software-properties-common
+Subtask 1.3: Add HashiCorp GPG Key
+Add the official HashiCorp GPG key to verify package authenticity.
+
+wget -O- https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+Subtask 1.4: Add HashiCorp Repository
+Add the HashiCorp repository to your system's package sources.
+
+echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+Subtask 1.5: Update Package List
+Update the package list to include the newly added HashiCorp repository.
+
+sudo apt update
+Subtask 1.6: Install Vault
+Install Vault using the package manager.
+
+sudo apt install -y vault
+Subtask 1.7: Verify Vault Binary Installation
+Check if Vault binary is installed and accessible in the system PATH.
+
+which vault
+Expected output should show the path to the Vault binary, typically:
+
+/usr/bin/vault
+Subtask 1.8: Create Vault User and Directories
+Create a dedicated user for running Vault and set up necessary directories.
+
+sudo useradd --system --home /etc/vault.d --shell /bin/false vault
+sudo mkdir -p /opt/vault/data
+sudo mkdir -p /etc/vault.d
+sudo chown -R vault:vault /opt/vault/data
+sudo chown -R vault:vault /etc/vault.d
+Subtask 1.9: Create Vault Configuration File
+Create a basic configuration file for Vault standalone operation.
+
+sudo tee /etc/vault.d/vault.hcl > /dev/null <<EOF
+ui = true
+disable_mlock = true
+
+storage "file" {
+  path = "/opt/vault/data"
+}
+
+listener "tcp" {
+  address     = "0.0.0.0:8200"
+  tls_disable = 1
+}
+
+api_addr = "http://127.0.0.1:8200"
+cluster_addr = "https://127.0.0.1:8201"
+EOF
+Subtask 1.10: Set Proper File Permissions
+Ensure the configuration file has appropriate permissions for security.
+
+sudo chown vault:vault /etc/vault.d/vault.hcl
+sudo chmod 640 /etc/vault.d/vault.hcl
+Subtask 1.11: Create Systemd Service File
+Create a systemd service file to manage Vault as a system service.
+
+sudo tee /etc/systemd/system/vault.service > /dev/null <<EOF
+[Unit]
+Description=HashiCorp Vault
+Documentation=https://www.vaultproject.io/docs/
+Requires=network-online.target
+After=network-online.target
+ConditionFileNotEmpty=/etc/vault.d/vault.hcl
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=notify
+User=vault
+Group=vault
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+SecureBits=keep-caps
+AmbientCapabilities=CAP_IPC_LOCK
+Capabilities=CAP_IPC_LOCK+ep
+CapabilityBoundingSet=CAP_SYSLOG CAP_IPC_LOCK
+NoNewPrivileges=yes
+ExecStart=/usr/bin/vault server -config=/etc/vault.d/vault.hcl
+ExecReload=/bin/kill --signal HUP \$MAINPID
+KillMode=process
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+StartLimitInterval=60
+StartLimitBurst=3
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target
+EOF
+Subtask 1.12: Enable and Start Vault Service
+Enable the Vault service to start automatically on boot and start it immediately.
+
+sudo systemctl daemon-reload
+sudo systemctl enable vault
+sudo systemctl start vault
+Subtask 1.13: Check Vault Service Status
+Verify that the Vault service is running properly.
+
+sudo systemctl status vault
+Expected output should show the service as active (running).
+
+Task 2: Verify Installation Using the Vault CLI
+Subtask 2.1: Set Vault Address Environment Variable
+Configure the environment variable to point to your local Vault instance.
+
+export VAULT_ADDR='http://127.0.0.1:8200'
+echo 'export VAULT_ADDR="http://127.0.0.1:8200"' >> ~/.bashrc
+Subtask 2.2: Check Vault Status
+Verify that Vault is accessible via the CLI and check its current status.
+
+vault status
+Expected output should show Vault is running but sealed and not initialized.
+
+Subtask 2.3: Initialize Vault
+Initialize Vault with default settings (5 key shares, 3 key threshold).
+
+vault operator init
+Important: Save the output containing the 5 unseal keys and initial root token in a secure location. You will need these for unsealing Vault and initial authentication.
+
+Subtask 2.4: Unseal Vault
+Use three of the five unseal keys to unseal Vault. Run the following command three times with different unseal keys:
+
+vault operator unseal
+When prompted, enter one of the unseal keys from the initialization output. Repeat this process three times with different keys.
+
+Subtask 2.5: Authenticate with Root Token
+Authenticate to Vault using the initial root token from the initialization output.
+
+vault auth
+When prompted, enter the Initial Root Token from the initialization step.
+
+Subtask 2.6: Verify Vault Functionality
+Test basic Vault functionality by checking the status again.
+
+vault status
+The output should now show:
+
+Sealed: false
+Initialized: true
+Subtask 2.7: Test Secret Storage
+Create a test secret to verify Vault is working correctly.
+
+vault kv put secret/hello foo=world
+Subtask 2.8: Retrieve Test Secret
+Retrieve the test secret to confirm storage and retrieval functionality.
+
+vault kv get secret/hello
+Expected output should display the key-value pair you stored.
+
+Subtask 2.9: List Available Auth Methods
+Check the available authentication methods in your Vault instance.
+
+vault auth list
+Subtask 2.10: List Available Secret Engines
+Display the mounted secret engines in your Vault instance.
+
+vault secrets list
+Troubleshooting Tips
+Common Issues and Solutions
+Issue: Vault service fails to start
+
+Solution: Check the configuration file syntax using vault server -config=/etc/vault.d/vault.hcl -test
+Issue: Permission denied errors
+
+Solution: Verify file ownership and permissions for /opt/vault/data and /etc/vault.d/
+Issue: Cannot connect to Vault
+
+Solution: Ensure the VAULT_ADDR environment variable is set correctly and the service is running
+Issue: Vault is sealed after restart
+
+Solution: This is normal behavior. You must unseal Vault after each restart using the unseal keys
+Verification Commands
+To verify your installation is complete and working:
+
+# Check service status
+sudo systemctl status vault
+
+# Verify Vault is responding
+vault status
+
+# Test authentication
+vault auth list
+
+# Check mounted secret engines
+vault secrets list
+Conclusion
+Congratulations! You have successfully completed Lab 1: Installing Vault. In this lab, you accomplished the following:
+
+Installed HashiCorp Vault on a Linux server using the official repository
+Configured Vault for standalone operation with file storage backend
+Created a systemd service to manage Vault as a system service
+Initialized and unsealed a new Vault instance
+Verified the installation using the Vault CLI
+Tested basic functionality by storing and retrieving secrets
+This installation provides you with a fully functional Vault instance running on a single Linux machine. You now have a solid foundation for exploring Vault's advanced features such as authentication methods, secret engines, policies, and more complex deployment scenarios.
+
+Key Takeaways:
+
+Vault requires initialization and unsealing before it can be used
+The unseal keys and root token are critical for Vault operations and should be stored securely
+Vault runs as a system service and can be managed using standard systemctl commands
+The file storage backend is suitable for development and testing but not recommended for production use
+This standalone Vault installation serves as an excellent starting point for learning secrets management, implementing security policies, and understanding how modern applications can securely store and retrieve sensitive information.
