@@ -1,0 +1,508 @@
+Vault Authentication Methods
+Lab Objectives
+By the end of this lab, students will be able to:
+
+Understand the fundamentals of HashiCorp Vault authentication methods
+Install and configure HashiCorp Vault on a Linux system
+Set up and configure LDAP authentication backend in Vault
+Create and manage LDAP authentication policies
+Test authentication through Vault CLI using LDAP credentials
+Troubleshoot common authentication issues in Vault
+Prerequisites
+Before starting this lab, students should have:
+
+Basic understanding of Linux command line operations
+Familiarity with authentication concepts (users, groups, permissions)
+Basic knowledge of LDAP directory services
+Understanding of security principles and access control
+Experience with text editors like nano or vim
+Lab Environment
+Al Nafi provides Linux-based cloud machines for this lab. Simply click Start Lab to access your dedicated Linux machine. The provided Linux machine is bare metal with no pre-installed tools, so you will need to install all required tools during the lab following the instructions provided.
+
+Task 1: Environment Setup and Vault Installation
+Subtask 1.1: Update System and Install Dependencies
+First, update your system and install the necessary dependencies.
+
+# Update package repositories
+sudo apt update && sudo apt upgrade -y
+
+# Install required packages
+sudo apt install -y wget curl unzip gpg software-properties-common
+
+# Install OpenLDAP utilities for testing
+sudo apt install -y ldap-utils
+Subtask 1.2: Install HashiCorp Vault
+Download and install the latest version of HashiCorp Vault.
+
+# Add HashiCorp GPG key
+wget -O- https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+
+# Add HashiCorp repository
+echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+
+# Update package list and install Vault
+sudo apt update
+sudo apt install -y vault
+
+# Verify installation
+vault version
+Subtask 1.3: Install and Configure OpenLDAP Server
+Since we need an LDAP server for authentication testing, we'll install OpenLDAP.
+
+# Install OpenLDAP server and utilities
+sudo apt install -y slapd ldap-utils
+
+# During installation, you'll be prompted for administrator password
+# Use: admin123 (remember this password)
+
+# Reconfigure slapd for proper setup
+sudo dpkg-reconfigure slapd
+During the reconfiguration, use these settings:
+
+Omit OpenLDAP server configuration? No
+DNS domain name: example.com
+Organization name: Example Organization
+Administrator password: admin123
+Database backend: MDB
+Remove database when slapd is purged? No
+Move old database? Yes
+Subtask 1.4: Configure LDAP Directory Structure
+Create a basic LDAP directory structure with users for testing.
+
+# Create LDAP configuration file
+cat > /tmp/base.ldif << 'EOF'
+dn: ou=people,dc=example,dc=com
+objectClass: organizationalUnit
+ou: people
+
+dn: ou=groups,dc=example,dc=com
+objectClass: organizationalUnit
+ou: groups
+
+dn: cn=developers,ou=groups,dc=example,dc=com
+objectClass: groupOfNames
+cn: developers
+member: uid=john,ou=people,dc=example,dc=com
+member: uid=jane,ou=people,dc=example,dc=com
+
+dn: uid=john,ou=people,dc=example,dc=com
+objectClass: inetOrgPerson
+objectClass: posixAccount
+objectClass: shadowAccount
+uid: john
+sn: Doe
+givenName: John
+cn: John Doe
+displayName: John Doe
+uidNumber: 1001
+gidNumber: 1001
+userPassword: {SSHA}password123
+homeDirectory: /home/john
+loginShell: /bin/bash
+
+dn: uid=jane,ou=people,dc=example,dc=com
+objectClass: inetOrgPerson
+objectClass: posixAccount
+objectClass: shadowAccount
+uid: jane
+sn: Smith
+givenName: Jane
+cn: Jane Smith
+displayName: Jane Smith
+uidNumber: 1002
+gidNumber: 1002
+userPassword: {SSHA}password456
+homeDirectory: /home/jane
+loginShell: /bin/bash
+EOF
+
+# Add entries to LDAP
+ldapadd -x -D "cn=admin,dc=example,dc=com" -w admin123 -f /tmp/base.ldif
+Subtask 1.5: Verify LDAP Installation
+Test that LDAP is working correctly.
+
+# Search for all entries
+ldapsearch -x -b "dc=example,dc=com" -D "cn=admin,dc=example,dc=com" -w admin123
+
+# Test user authentication
+ldapwhoami -x -D "uid=john,ou=people,dc=example,dc=com" -w password123
+Task 2: Vault Server Configuration and Initialization
+Subtask 2.1: Create Vault Configuration
+Create a configuration file for Vault server.
+
+# Create Vault configuration directory
+sudo mkdir -p /etc/vault.d
+
+# Create Vault configuration file
+sudo tee /etc/vault.d/vault.hcl << 'EOF'
+ui = true
+disable_mlock = true
+
+storage "file" {
+  path = "/opt/vault/data"
+}
+
+listener "tcp" {
+  address     = "127.0.0.1:8200"
+  tls_disable = 1
+}
+
+api_addr = "http://127.0.0.1:8200"
+cluster_addr = "https://127.0.0.1:8201"
+EOF
+
+# Create Vault data directory
+sudo mkdir -p /opt/vault/data
+sudo chown vault:vault /opt/vault/data
+Subtask 2.2: Start Vault Server
+Start the Vault server in development mode for this lab.
+
+# Start Vault server in background
+vault server -config=/etc/vault.d/vault.hcl &
+
+# Wait for server to start
+sleep 5
+
+# Set environment variable for Vault address
+export VAULT_ADDR='http://127.0.0.1:8200'
+
+# Add to bash profile for persistence
+echo 'export VAULT_ADDR="http://127.0.0.1:8200"' >> ~/.bashrc
+Subtask 2.3: Initialize and Unseal Vault
+Initialize Vault and unseal it for use.
+
+# Initialize Vault (save the output!)
+vault operator init -key-shares=1 -key-threshold=1 > /tmp/vault-init.txt
+
+# Display initialization output
+cat /tmp/vault-init.txt
+
+# Extract unseal key and root token
+UNSEAL_KEY=$(grep 'Unseal Key 1:' /tmp/vault-init.txt | awk '{print $NF}')
+ROOT_TOKEN=$(grep 'Initial Root Token:' /tmp/vault-init.txt | awk '{print $NF}')
+
+# Unseal Vault
+vault operator unseal $UNSEAL_KEY
+
+# Authenticate with root token
+vault auth $ROOT_TOKEN
+
+# Verify Vault status
+vault status
+Task 3: Configure LDAP Authentication Backend
+Subtask 3.1: Enable LDAP Authentication Method
+Enable and configure the LDAP authentication method in Vault.
+
+# Enable LDAP auth method
+vault auth enable ldap
+
+# Verify LDAP auth method is enabled
+vault auth list
+Subtask 3.2: Configure LDAP Authentication Settings
+Configure Vault to connect to your LDAP server.
+
+# Configure LDAP authentication
+vault write auth/ldap/config \
+    url="ldap://127.0.0.1:389" \
+    userdn="ou=people,dc=example,dc=com" \
+    userattr="uid" \
+    groupdn="ou=groups,dc=example,dc=com" \
+    groupfilter="(&(objectClass=groupOfNames)(member={{.UserDN}}))" \
+    groupattr="cn" \
+    binddn="cn=admin,dc=example,dc=com" \
+    bindpass="admin123" \
+    insecure_tls=true \
+    starttls=false
+
+# Verify LDAP configuration
+vault read auth/ldap/config
+Subtask 3.3: Create Vault Policies
+Create policies that will be assigned to LDAP users and groups.
+
+# Create a policy for developers
+vault policy write developers - << 'EOF'
+# Allow developers to read and write secrets under secret/dev/*
+path "secret/data/dev/*" {
+  capabilities = ["create", "read", "update", "delete", "list"]
+}
+
+# Allow developers to list secrets
+path "secret/metadata/dev/*" {
+  capabilities = ["list"]
+}
+
+# Allow developers to read their own user info
+path "auth/ldap/users/{{identity.entity.aliases.auth_ldap_*.name}}" {
+  capabilities = ["read"]
+}
+EOF
+
+# Create a policy for regular users
+vault policy write users - << 'EOF'
+# Allow users to read secrets under secret/shared/*
+path "secret/data/shared/*" {
+  capabilities = ["read", "list"]
+}
+
+# Allow users to read their own user info
+path "auth/ldap/users/{{identity.entity.aliases.auth_ldap_*.name}}" {
+  capabilities = ["read"]
+}
+EOF
+
+# List all policies
+vault policy list
+Subtask 3.4: Map LDAP Groups to Vault Policies
+Configure group mappings to assign policies based on LDAP group membership.
+
+# Map LDAP group 'developers' to Vault policy 'developers'
+vault write auth/ldap/groups/developers policies=developers
+
+# Create a mapping for individual users
+vault write auth/ldap/users/john policies=users
+vault write auth/ldap/users/jane policies=users
+
+# Verify group mappings
+vault read auth/ldap/groups/developers
+vault read auth/ldap/users/john
+vault read auth/ldap/users/jane
+Task 4: Test LDAP Authentication
+Subtask 4.1: Enable KV Secrets Engine
+Enable the Key-Value secrets engine to test our authentication.
+
+# Enable KV v2 secrets engine
+vault secrets enable -path=secret kv-v2
+
+# Verify secrets engine is enabled
+vault secrets list
+Subtask 4.2: Create Test Secrets
+Create some test secrets that our users will access.
+
+# Create secrets for developers
+vault kv put secret/dev/database username=devuser password=devpass123
+
+# Create secrets for shared access
+vault kv put secret/shared/api-key key=shared-api-key-12345
+
+# List secrets
+vault kv list secret/
+Subtask 4.3: Test Authentication with John (Developer)
+Test authentication using John's LDAP credentials.
+
+# Authenticate as John using LDAP
+vault auth -method=ldap username=john password=password123
+
+# Verify current token info
+vault token lookup
+
+# Test access to dev secrets (should work)
+vault kv get secret/dev/database
+
+# Test access to shared secrets (should work)
+vault kv get secret/shared/api-key
+
+# Try to create a new dev secret (should work for developers)
+vault kv put secret/dev/config environment=development debug=true
+Subtask 4.4: Test Authentication with Jane (Regular User)
+Test authentication using Jane's LDAP credentials.
+
+# Authenticate as Jane using LDAP
+vault auth -method=ldap username=jane password=password456
+
+# Verify current token info
+vault token lookup
+
+# Test access to shared secrets (should work)
+vault kv get secret/shared/api-key
+
+# Try to access dev secrets (should fail)
+echo "Testing access to dev secrets (should fail):"
+vault kv get secret/dev/database || echo "Access denied as expected"
+
+# Try to create a dev secret (should fail)
+echo "Testing creation of dev secrets (should fail):"
+vault kv put secret/dev/test key=value || echo "Access denied as expected"
+Subtask 4.5: Test Group-Based Authentication
+Verify that group membership affects permissions.
+
+# Re-authenticate as root to modify group mappings
+vault auth $ROOT_TOKEN
+
+# Add Jane to the developers group in LDAP
+cat > /tmp/add-jane-to-dev.ldif << 'EOF'
+dn: cn=developers,ou=groups,dc=example,dc=com
+changetype: modify
+add: member
+member: uid=jane,ou=people,dc=example,dc=com
+EOF
+
+ldapmodify -x -D "cn=admin,dc=example,dc=com" -w admin123 -f /tmp/add-jane-to-dev.ldif
+
+# Now authenticate as Jane again
+vault auth -method=ldap username=jane password=password456
+
+# Test access to dev secrets (should now work)
+vault kv get secret/dev/database
+
+# Create a new dev secret (should now work)
+vault kv put secret/dev/jane-test created-by=jane
+Task 5: Advanced LDAP Configuration and Troubleshooting
+Subtask 5.1: Configure Token TTL and Renewal
+Configure token time-to-live settings for LDAP authentication.
+
+# Re-authenticate as root
+vault auth $ROOT_TOKEN
+
+# Configure LDAP auth method with TTL settings
+vault write auth/ldap/config \
+    url="ldap://127.0.0.1:389" \
+    userdn="ou=people,dc=example,dc=com" \
+    userattr="uid" \
+    groupdn="ou=groups,dc=example,dc=com" \
+    groupfilter="(&(objectClass=groupOfNames)(member={{.UserDN}}))" \
+    groupattr="cn" \
+    binddn="cn=admin,dc=example,dc=com" \
+    bindpass="admin123" \
+    insecure_tls=true \
+    starttls=false \
+    token_ttl=1h \
+    token_max_ttl=4h
+
+# Test authentication with TTL
+vault auth -method=ldap username=john password=password123
+
+# Check token information including TTL
+vault token lookup
+Subtask 5.2: Monitor Authentication Logs
+Enable and monitor Vault audit logs to track authentication attempts.
+
+# Re-authenticate as root
+vault auth $ROOT_TOKEN
+
+# Enable file audit device
+vault audit enable file file_path=/tmp/vault-audit.log
+
+# Test authentication to generate logs
+vault auth -method=ldap username=john password=password123
+
+# View audit logs
+echo "Recent authentication events:"
+tail -n 5 /tmp/vault-audit.log | jq '.type, .auth.display_name, .auth.policies'
+Subtask 5.3: Troubleshooting Common Issues
+Test and resolve common LDAP authentication issues.
+
+# Re-authenticate as root
+vault auth $ROOT_TOKEN
+
+# Test LDAP connectivity
+vault write auth/ldap/config \
+    url="ldap://127.0.0.1:389" \
+    userdn="ou=people,dc=example,dc=com" \
+    userattr="uid" \
+    groupdn="ou=groups,dc=example,dc=com" \
+    groupfilter="(&(objectClass=groupOfNames)(member={{.UserDN}}))" \
+    groupattr="cn" \
+    binddn="cn=admin,dc=example,dc=com" \
+    bindpass="admin123" \
+    insecure_tls=true \
+    starttls=false
+
+# Test with wrong password (should fail)
+echo "Testing with wrong password (should fail):"
+vault auth -method=ldap username=john password=wrongpassword || echo "Authentication failed as expected"
+
+# Test with non-existent user (should fail)
+echo "Testing with non-existent user (should fail):"
+vault auth -method=ldap username=nonexistent password=password123 || echo "Authentication failed as expected"
+
+# Check LDAP server connectivity
+ldapsearch -x -H ldap://127.0.0.1:389 -b "dc=example,dc=com" -D "cn=admin,dc=example,dc=com" -w admin123 "(uid=john)"
+Task 6: Cleanup and Verification
+Subtask 6.1: Verify All Configurations
+Perform a final verification of all configurations.
+
+# Re-authenticate as root
+vault auth $ROOT_TOKEN
+
+# List all authentication methods
+vault auth list
+
+# List all policies
+vault policy list
+
+# Check LDAP configuration
+vault read auth/ldap/config
+
+# Check group mappings
+vault list auth/ldap/groups
+vault list auth/ldap/users
+
+# Test final authentication
+vault auth -method=ldap username=john password=password123
+vault kv get secret/dev/database
+Subtask 6.2: Document Configuration
+Create a summary of the configuration for future reference.
+
+# Create configuration summary
+cat > /tmp/vault-ldap-summary.txt << 'EOF'
+Vault LDAP Authentication Configuration Summary
+==============================================
+
+LDAP Server: ldap://127.0.0.1:389
+Base DN: dc=example,dc=com
+User DN: ou=people,dc=example,dc=com
+Group DN: ou=groups,dc=example,dc=com
+
+Test Users:
+- john (password: password123) - Member of developers group
+- jane (password: password456) - Member of developers group
+
+Policies:
+- developers: Full access to secret/dev/*
+- users: Read access to secret/shared/*
+
+Group Mappings:
+- developers group -> developers policy
+
+Test Commands:
+vault auth -method=ldap username=john password=password123
+vault kv get secret/dev/database
+EOF
+
+cat /tmp/vault-ldap-summary.txt
+Troubleshooting Tips
+Common Issues and Solutions
+Issue 1: LDAP Connection Failed
+
+Verify LDAP server is running: sudo systemctl status slapd
+Check LDAP connectivity: ldapsearch -x -H ldap://127.0.0.1:389 -b "dc=example,dc=com"
+Verify bind credentials in Vault configuration
+Issue 2: Authentication Succeeds but No Policies Applied
+
+Check group membership in LDAP: ldapsearch -x -b "cn=developers,ou=groups,dc=example,dc=com"
+Verify group filter configuration in Vault
+Ensure group mappings are correctly configured: vault read auth/ldap/groups/developers
+Issue 3: Token Permissions Denied
+
+Verify policy syntax: vault policy read developers
+Check token policies: vault token lookup
+Ensure paths in policies match secret paths
+Issue 4: Vault Server Not Responding
+
+Check Vault server status: vault status
+Verify Vault server process: ps aux | grep vault
+Check Vault logs for errors
+Conclusion
+In this lab, you have successfully:
+
+Installed and configured HashiCorp Vault on a Linux system
+Set up an OpenLDAP server with users and groups for authentication testing
+Configured Vault's LDAP authentication backend to integrate with your LDAP directory
+Created and applied Vault policies to control access to secrets based on user roles
+Tested authentication through the Vault CLI using LDAP credentials
+Implemented group-based access control by mapping LDAP groups to Vault policies
+Configured advanced settings like token TTL and audit logging
+Troubleshot common authentication issues
+This lab demonstrates the power of centralized authentication in Vault, allowing organizations to leverage existing LDAP infrastructure for secure access control to secrets and sensitive data. The skills learned here are directly applicable to enterprise environments where LDAP or Active Directory authentication is required for Vault deployments.
+
+Understanding Vault authentication methods is crucial for implementing secure secret management in production environments, where proper authentication and authorization are fundamental to maintaining security posture and compliance requirements.
