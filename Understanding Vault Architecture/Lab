@@ -1,0 +1,860 @@
+Understanding Vault Architecture
+Lab Objectives
+By the end of this lab, you will be able to:
+
+Understand the core components of HashiCorp Vault architecture
+Explore Vault Server components and their functions
+Configure and work with different Storage Backends
+Implement and manage various Secrets Engines
+Analyze how Vault components interact within the overall architecture
+Demonstrate practical knowledge of Vault's structural design
+Prerequisites
+Before starting this lab, you should have:
+
+Basic understanding of Linux command line operations
+Familiarity with text editors (nano, vim, or similar)
+Basic knowledge of JSON and YAML formats
+Understanding of basic security concepts
+Completion of Lab 1 or equivalent Vault installation experience
+Lab Environment
+Al Nafi provides Linux-based cloud machines for this lab. Simply click Start Lab to access your dedicated environment. The provided Linux machine is bare metal with no pre-installed tools, so you will install all required components during the lab exercises.
+
+Task 1: Explore Vault Server Components
+Subtask 1.1: Install and Initialize Vault
+First, let's install Vault on your Linux machine and understand its basic server architecture.
+
+Step 1: Download and Install Vault
+
+# Update system packages
+sudo apt update
+
+# Install required dependencies
+sudo apt install -y wget unzip curl
+
+# Download Vault binary
+wget https://releases.hashicorp.com/vault/1.15.2/vault_1.15.2_linux_amd64.zip
+
+# Unzip the binary
+unzip vault_1.15.2_linux_amd64.zip
+
+# Move to system path
+sudo mv vault /usr/local/bin/
+
+# Verify installation
+vault version
+Step 2: Create Vault Configuration Directory
+
+# Create configuration directory
+sudo mkdir -p /etc/vault.d
+sudo mkdir -p /opt/vault/data
+
+# Create a basic server configuration file
+sudo tee /etc/vault.d/vault.hcl > /dev/null <<EOF
+ui = true
+disable_mlock = true
+
+storage "file" {
+  path = "/opt/vault/data"
+}
+
+listener "tcp" {
+  address     = "127.0.0.1:8200"
+  tls_disable = 1
+}
+
+api_addr = "http://127.0.0.1:8200"
+cluster_addr = "https://127.0.0.1:8201"
+EOF
+Step 3: Start Vault Server
+
+# Start Vault server in development mode for learning
+vault server -config=/etc/vault.d/vault.hcl &
+
+# Wait a moment for server to start
+sleep 5
+
+# Set environment variable for Vault address
+export VAULT_ADDR='http://127.0.0.1:8200'
+
+# Check server status
+vault status
+Subtask 1.2: Initialize and Unseal Vault
+Step 1: Initialize Vault
+
+# Initialize Vault (this creates the master key)
+vault operator init -key-shares=5 -key-threshold=3 > vault-init.txt
+
+# Display the initialization output
+cat vault-init.txt
+Step 2: Unseal Vault
+
+# Extract unseal keys from the initialization file
+UNSEAL_KEY_1=$(grep 'Unseal Key 1:' vault-init.txt | awk '{print $4}')
+UNSEAL_KEY_2=$(grep 'Unseal Key 2:' vault-init.txt | awk '{print $4}')
+UNSEAL_KEY_3=$(grep 'Unseal Key 3:' vault-init.txt | awk '{print $4}')
+
+# Unseal Vault using 3 keys (threshold)
+vault operator unseal $UNSEAL_KEY_1
+vault operator unseal $UNSEAL_KEY_2
+vault operator unseal $UNSEAL_KEY_3
+
+# Verify Vault is unsealed
+vault status
+Step 3: Authenticate with Root Token
+
+# Extract root token
+ROOT_TOKEN=$(grep 'Initial Root Token:' vault-init.txt | awk '{print $4}')
+
+# Login with root token
+vault auth $ROOT_TOKEN
+
+# Verify authentication
+vault token lookup
+Subtask 1.3: Explore Server Architecture Components
+Step 1: Examine Server Configuration
+
+# View the current server configuration
+cat /etc/vault.d/vault.hcl
+
+# Check server status and configuration details
+vault status -format=json | jq '.'
+Step 2: Understand Server Modes
+
+# Check if server is in HA mode
+vault read sys/leader
+
+# View server health
+vault read sys/health
+
+# Check seal status details
+vault read sys/seal-status
+Step 3: Explore Server Capabilities
+
+# List server capabilities
+vault read sys/capabilities-self
+
+# View server configuration
+vault read sys/config/state/sanitized
+Task 2: Configure and Work with Storage Backends
+Subtask 2.1: Understand File Storage Backend
+Step 1: Examine Current File Storage
+
+# Check the data directory structure
+ls -la /opt/vault/data/
+
+# View storage configuration
+vault read sys/storage/raft/configuration 2>/dev/null || echo "File storage backend in use"
+
+# Check storage usage
+du -sh /opt/vault/data/
+Step 2: Create Test Data to Understand Storage
+
+# Enable KV secrets engine to generate storage data
+vault secrets enable -path=test-storage kv-v2
+
+# Write some test secrets
+vault kv put test-storage/database username=admin password=secret123
+vault kv put test-storage/api-keys primary=abc123 secondary=def456
+vault kv put test-storage/certificates ssl-cert=cert-data ssl-key=key-data
+
+# Examine how data is stored on disk
+find /opt/vault/data -type f -name "*.db" -o -name "*.json" | head -10
+Step 3: Understand Storage Structure
+
+# Create a script to explore storage structure
+tee explore-storage.sh > /dev/null <<'EOF'
+#!/bin/bash
+echo "=== Vault Storage Analysis ==="
+echo "Storage Path: /opt/vault/data"
+echo ""
+echo "Directory Structure:"
+tree /opt/vault/data 2>/dev/null || find /opt/vault/data -type d
+echo ""
+echo "File Count and Sizes:"
+find /opt/vault/data -type f | wc -l
+echo "Total storage size:"
+du -sh /opt/vault/data
+EOF
+
+chmod +x explore-storage.sh
+./explore-storage.sh
+Subtask 2.2: Configure Alternative Storage Backend (Consul)
+Step 1: Install and Configure Consul
+
+# Download Consul
+wget https://releases.hashicorp.com/consul/1.16.1/consul_1.16.1_linux_amd64.zip
+
+# Unzip and install
+unzip consul_1.16.1_linux_amd64.zip
+sudo mv consul /usr/local/bin/
+
+# Create Consul configuration
+sudo mkdir -p /etc/consul.d
+sudo tee /etc/consul.d/consul.hcl > /dev/null <<EOF
+datacenter = "dc1"
+data_dir = "/opt/consul"
+log_level = "INFO"
+server = true
+bootstrap_expect = 1
+ui_config {
+  enabled = true
+}
+client_addr = "0.0.0.0"
+bind_addr = "127.0.0.1"
+EOF
+
+# Create data directory
+sudo mkdir -p /opt/consul
+Step 2: Start Consul
+
+# Start Consul in background
+consul agent -config-dir=/etc/consul.d &
+
+# Wait for Consul to start
+sleep 10
+
+# Verify Consul is running
+consul members
+Step 3: Create Vault Configuration with Consul Backend
+
+# Stop current Vault server
+pkill vault
+
+# Create new configuration with Consul backend
+sudo tee /etc/vault.d/vault-consul.hcl > /dev/null <<EOF
+ui = true
+disable_mlock = true
+
+storage "consul" {
+  address = "127.0.0.1:8500"
+  path    = "vault/"
+}
+
+listener "tcp" {
+  address     = "127.0.0.1:8200"
+  tls_disable = 1
+}
+
+api_addr = "http://127.0.0.1:8200"
+cluster_addr = "https://127.0.0.1:8201"
+EOF
+
+# Start Vault with Consul backend
+vault server -config=/etc/vault.d/vault-consul.hcl &
+
+# Wait for server to start
+sleep 5
+Subtask 2.3: Compare Storage Backends
+Step 1: Initialize New Vault Instance
+
+# Initialize the new Vault instance
+vault operator init -key-shares=3 -key-threshold=2 > vault-consul-init.txt
+
+# Unseal the new instance
+UNSEAL_KEY_1=$(grep 'Unseal Key 1:' vault-consul-init.txt | awk '{print $4}')
+UNSEAL_KEY_2=$(grep 'Unseal Key 2:' vault-consul-init.txt | awk '{print $4}')
+
+vault operator unseal $UNSEAL_KEY_1
+vault operator unseal $UNSEAL_KEY_2
+
+# Authenticate
+ROOT_TOKEN=$(grep 'Initial Root Token:' vault-consul-init.txt | awk '{print $4}')
+vault auth $ROOT_TOKEN
+Step 2: Test Consul Storage
+
+# Enable secrets engine
+vault secrets enable -path=consul-test kv-v2
+
+# Add test data
+vault kv put consul-test/app config=production database=mysql
+
+# Check Consul for stored data
+consul kv get -recurse vault/
+
+# Compare storage methods
+echo "=== Storage Backend Comparison ==="
+echo "File Backend: Direct file system storage"
+echo "Consul Backend: Distributed key-value storage"
+Task 3: Implement and Manage Secrets Engines
+Subtask 3.1: Explore Built-in Secrets Engines
+Step 1: List Available Secrets Engines
+
+# List currently enabled secrets engines
+vault secrets list
+
+# List all available secrets engine types
+vault secrets list -detailed
+
+# Get help for secrets engines
+vault secrets -help
+Step 2: Enable Key-Value Secrets Engine
+
+# Enable KV version 2 secrets engine
+vault secrets enable -path=myapp kv-v2
+
+# Configure the KV engine
+vault secrets tune -max-lease-ttl=8760h myapp
+
+# List secrets engines again to see the new one
+vault secrets list -detailed
+Step 3: Work with KV Secrets Engine
+
+# Store secrets in KV engine
+vault kv put myapp/database username=dbuser password=dbpass123 host=localhost
+
+# Store application secrets
+vault kv put myapp/api-keys stripe=sk_test_123 paypal=pp_456 aws=AKIA789
+
+# Store configuration data
+vault kv put myapp/config debug=true port=8080 environment=production
+
+# List all secrets
+vault kv list myapp
+
+# Read secrets back
+vault kv get myapp/database
+vault kv get -format=json myapp/api-keys
+Subtask 3.2: Configure Database Secrets Engine
+Step 1: Install and Configure MySQL
+
+# Install MySQL server
+sudo apt install -y mysql-server
+
+# Start MySQL service
+sudo systemctl start mysql
+sudo systemctl enable mysql
+
+# Secure MySQL installation (set root password)
+sudo mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY 'rootpass123';"
+
+# Create a database and user for Vault
+sudo mysql -u root -prootpass123 -e "
+CREATE DATABASE vaultdb;
+CREATE USER 'vault-admin'@'localhost' IDENTIFIED BY 'vault-pass123';
+GRANT ALL PRIVILEGES ON vaultdb.* TO 'vault-admin'@'localhost';
+GRANT CREATE USER ON *.* TO 'vault-admin'@'localhost';
+GRANT SELECT ON mysql.user TO 'vault-admin'@'localhost';
+FLUSH PRIVILEGES;
+"
+Step 2: Enable and Configure Database Secrets Engine
+
+# Enable database secrets engine
+vault secrets enable database
+
+# Configure MySQL connection
+vault write database/config/mysql \
+    plugin_name=mysql-database-plugin \
+    connection_url="{{username}}:{{password}}@tcp(localhost:3306)/" \
+    allowed_roles="readonly,readwrite" \
+    username="vault-admin" \
+    password="vault-pass123"
+
+# Test the connection
+vault read database/config/mysql
+Step 3: Create Database Roles
+
+# Create a readonly role
+vault write database/roles/readonly \
+    db_name=mysql \
+    creation_statements="CREATE USER '{{name}}'@'localhost' IDENTIFIED BY '{{password}}';GRANT SELECT ON vaultdb.* TO '{{name}}'@'localhost';" \
+    default_ttl="1h" \
+    max_ttl="24h"
+
+# Create a readwrite role
+vault write database/roles/readwrite \
+    db_name=mysql \
+    creation_statements="CREATE USER '{{name}}'@'localhost' IDENTIFIED BY '{{password}}';GRANT SELECT,INSERT,UPDATE,DELETE ON vaultdb.* TO '{{name}}'@'localhost';" \
+    default_ttl="1h" \
+    max_ttl="24h"
+
+# List database roles
+vault list database/roles
+Step 4: Generate Dynamic Database Credentials
+
+# Generate readonly credentials
+vault read database/creds/readonly
+
+# Generate readwrite credentials
+vault read database/creds/readwrite
+
+# Store credentials in variables for testing
+READONLY_CREDS=$(vault read -format=json database/creds/readonly)
+DB_USER=$(echo $READONLY_CREDS | jq -r '.data.username')
+DB_PASS=$(echo $READONLY_CREDS | jq -r '.data.password')
+
+echo "Generated Database User: $DB_USER"
+echo "Generated Database Password: $DB_PASS"
+
+# Test the generated credentials
+mysql -u "$DB_USER" -p"$DB_PASS" -e "SHOW DATABASES;"
+Subtask 3.3: Configure PKI Secrets Engine
+Step 1: Enable PKI Secrets Engine
+
+# Enable PKI secrets engine
+vault secrets enable pki
+
+# Tune the PKI engine for longer TTL
+vault secrets tune -max-lease-ttl=8760h pki
+
+# Generate root CA certificate
+vault write pki/root/generate/internal \
+    common_name="My Company Root CA" \
+    ttl=8760h
+
+# Configure CA and CRL URLs
+vault write pki/config/urls \
+    issuing_certificates="http://127.0.0.1:8200/v1/pki/ca" \
+    crl_distribution_points="http://127.0.0.1:8200/v1/pki/crl"
+Step 2: Create PKI Role
+
+# Create a role for generating certificates
+vault write pki/roles/my-domain \
+    allowed_domains="example.com" \
+    allow_subdomains=true \
+    max_ttl="720h"
+
+# List PKI roles
+vault list pki/roles
+Step 3: Generate Certificates
+
+# Generate a certificate for a subdomain
+vault write pki/issue/my-domain \
+    common_name="test.example.com" \
+    ttl="24h"
+
+# Generate certificate and save to files
+vault write -format=json pki/issue/my-domain \
+    common_name="app.example.com" \
+    ttl="24h" > cert_output.json
+
+# Extract certificate components
+jq -r '.data.certificate' cert_output.json > app.crt
+jq -r '.data.private_key' cert_output.json > app.key
+jq -r '.data.ca_chain[]' cert_output.json > ca.crt
+
+# Verify certificate
+openssl x509 -in app.crt -text -noout | head -20
+Subtask 3.4: Configure AWS Secrets Engine
+Step 1: Enable AWS Secrets Engine
+
+# Enable AWS secrets engine
+vault secrets enable aws
+
+# Note: For this lab, we'll configure with dummy credentials
+# In production, use real AWS credentials with appropriate permissions
+vault write aws/config/root \
+    access_key="AKIAIOSFODNN7EXAMPLE" \
+    secret_key="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" \
+    region="us-east-1"
+Step 2: Create AWS Roles
+
+# Create an AWS role for EC2 access
+vault write aws/roles/ec2-role \
+    credential_type="iam_user" \
+    policy_document='{
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Effect": "Allow",
+          "Action": [
+            "ec2:DescribeInstances",
+            "ec2:DescribeImages",
+            "ec2:DescribeSnapshots"
+          ],
+          "Resource": "*"
+        }
+      ]
+    }'
+
+# Create an AWS role for S3 access
+vault write aws/roles/s3-role \
+    credential_type="iam_user" \
+    policy_document='{
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Effect": "Allow",
+          "Action": [
+            "s3:GetObject",
+            "s3:PutObject",
+            "s3:DeleteObject"
+          ],
+          "Resource": "arn:aws:s3:::my-bucket/*"
+        }
+      ]
+    }'
+
+# List AWS roles
+vault list aws/roles
+Task 4: Understand How Vault is Structured
+Subtask 4.1: Explore Vault's Logical Structure
+Step 1: Understand the Path-Based Structure
+
+# Create a comprehensive mapping script
+tee vault-structure-explorer.sh > /dev/null <<'EOF'
+#!/bin/bash
+echo "=== Vault Logical Structure Analysis ==="
+echo ""
+
+echo "1. System Backends (sys/):"
+echo "   - sys/auth: Authentication methods"
+echo "   - sys/policy: Policies"
+echo "   - sys/mounts: Secrets engines"
+echo "   - sys/audit: Audit devices"
+echo ""
+
+echo "2. Current Authentication Methods:"
+vault auth list
+echo ""
+
+echo "3. Current Secrets Engines:"
+vault secrets list
+echo ""
+
+echo "4. Current Policies:"
+vault policy list
+echo ""
+
+echo "5. System Health and Status:"
+vault status
+echo ""
+
+echo "6. Vault Capabilities:"
+vault read sys/capabilities-self
+EOF
+
+chmod +x vault-structure-explorer.sh
+./vault-structure-explorer.sh
+Step 2: Map the Secrets Engine Hierarchy
+
+# Create a script to map all secrets
+tee map-secrets.sh > /dev/null <<'EOF'
+#!/bin/bash
+echo "=== Vault Secrets Mapping ==="
+echo ""
+
+# Function to safely list secrets
+list_secrets() {
+    local path=$1
+    echo "Exploring path: $path"
+    vault kv list "$path" 2>/dev/null || echo "  (No secrets or access denied)"
+    echo ""
+}
+
+# Map KV secrets
+echo "Key-Value Secrets:"
+for engine in $(vault secrets list -format=json | jq -r 'to_entries[] | select(.value.type == "kv") | .key' | sed 's/\///'); do
+    echo "Engine: $engine"
+    list_secrets "$engine"
+done
+
+echo "Database Dynamic Secrets:"
+vault list database/roles 2>/dev/null || echo "No database roles configured"
+echo ""
+
+echo "PKI Certificates:"
+vault list pki/roles 2>/dev/null || echo "No PKI roles configured"
+echo ""
+
+echo "AWS Dynamic Secrets:"
+vault list aws/roles 2>/dev/null || echo "No AWS roles configured"
+EOF
+
+chmod +x map-secrets.sh
+./map-secrets.sh
+Subtask 4.2: Understand Authentication and Authorization Flow
+Step 1: Create and Test Policies
+
+# Create a policy for application access
+vault policy write app-policy - <<EOF
+# Allow reading application secrets
+path "myapp/data/*" {
+  capabilities = ["read"]
+}
+
+# Allow listing secrets
+path "myapp/metadata/*" {
+  capabilities = ["list"]
+}
+
+# Allow generating database credentials
+path "database/creds/readonly" {
+  capabilities = ["read"]
+}
+EOF
+
+# Create a policy for admin access
+vault policy write admin-policy - <<EOF
+# Full access to application secrets
+path "myapp/*" {
+  capabilities = ["create", "read", "update", "delete", "list"]
+}
+
+# Full access to database credentials
+path "database/*" {
+  capabilities = ["create", "read", "update", "delete", "list"]
+}
+
+# Access to PKI
+path "pki/*" {
+  capabilities = ["create", "read", "update", "delete", "list"]
+}
+EOF
+
+# List all policies
+vault policy list
+Step 2: Enable and Configure Authentication Methods
+
+# Enable userpass authentication
+vault auth enable userpass
+
+# Create users with different policies
+vault write auth/userpass/users/appuser \
+    password=apppass123 \
+    policies=app-policy
+
+vault write auth/userpass/users/admin \
+    password=adminpass123 \
+    policies=admin-policy
+
+# List authentication methods
+vault auth list
+Step 3: Test Authentication and Authorization
+
+# Test app user authentication
+vault auth -method=userpass username=appuser password=apppass123
+
+# Test app user permissions
+vault kv get myapp/database  # Should work
+vault kv put myapp/test key=value  # Should fail
+
+# Test database credential generation
+vault read database/creds/readonly  # Should work
+
+# Re-authenticate as admin
+vault auth $ROOT_TOKEN
+
+# Test admin authentication
+vault auth -method=userpass username=admin password=adminpass123
+
+# Test admin permissions
+vault kv put myapp/admin-secret admin=true  # Should work
+vault read database/creds/readwrite  # Should work
+
+# Return to root token
+vault auth $ROOT_TOKEN
+Subtask 4.3: Analyze Vault Architecture Components
+Step 1: Create Architecture Analysis Script
+
+# Create comprehensive architecture analysis
+tee vault-architecture-analysis.sh > /dev/null <<'EOF'
+#!/bin/bash
+echo "=== Complete Vault Architecture Analysis ==="
+echo ""
+
+echo "1. CORE COMPONENTS:"
+echo "   a) Vault Server Status:"
+vault status
+echo ""
+
+echo "   b) Storage Backend:"
+echo "      Current: File-based storage at /opt/vault/data"
+echo "      Size: $(du -sh /opt/vault/data | cut -f1)"
+echo "      Files: $(find /opt/vault/data -type f | wc -l)"
+echo ""
+
+echo "2. SECRETS ENGINES:"
+echo "   Enabled engines and their purposes:"
+vault secrets list -detailed
+echo ""
+
+echo "3. AUTHENTICATION METHODS:"
+echo "   Available authentication backends:"
+vault auth list -detailed
+echo ""
+
+echo "4. POLICIES:"
+echo "   Security policies in effect:"
+for policy in $(vault policy list); do
+    echo "   - $policy"
+done
+echo ""
+
+echo "5. AUDIT DEVICES:"
+vault audit list 2>/dev/null || echo "   No audit devices enabled"
+echo ""
+
+echo "6. SYSTEM INFORMATION:"
+echo "   Vault Version: $(vault version)"
+echo "   Server Mode: $(vault status -format=json | jq -r '.ha_enabled')"
+echo "   Sealed Status: $(vault status -format=json | jq -r '.sealed')"
+echo ""
+
+echo "7. PERFORMANCE METRICS:"
+echo "   Active Tokens: $(vault list auth/token/accessors 2>/dev/null | wc -l)"
+echo "   Total Secrets Engines: $(vault secrets list -format=json | jq '. | length')"
+echo "   Total Auth Methods: $(vault auth list -format=json | jq '. | length')"
+EOF
+
+chmod +x vault-architecture-analysis.sh
+./vault-architecture-analysis.sh
+Step 2: Create Visual Architecture Map
+
+# Create a visual representation of the architecture
+tee create-architecture-map.sh > /dev/null <<'EOF'
+#!/bin/bash
+echo "=== Vault Architecture Map ==="
+echo ""
+echo "┌─────────────────────────────────────────────────────────────┐"
+echo "│                    VAULT ARCHITECTURE                       │"
+echo "├─────────────────────────────────────────────────────────────┤"
+echo "│  CLIENT LAYER                                               │"
+echo "│  ├── CLI (vault command)                                    │"
+echo "│  ├── HTTP API (port 8200)                                   │"
+echo "│  └── UI (web interface)                                     │"
+echo "├─────────────────────────────────────────────────────────────┤"
+echo "│  VAULT CORE                                                 │"
+echo "│  ├── Authentication                                         │"
+echo "│  │   ├── Token Auth (default)                              │"
+echo "│  │   └── UserPass Auth                                     │"
+echo "│  ├── Authorization (Policies)                              │"
+echo "│  │   ├── app-policy                                        │"
+echo "│  │   └── admin-policy                                      │"
+echo "│  └── Audit (logging)                                       │"
+echo "├─────────────────────────────────────────────────────────────┤"
+echo "│  SECRETS ENGINES                                            │"
+echo "│  ├── KV v2 (myapp/, test-storage/, consul-test/)           │"
+echo "│  ├── Database (MySQL dynamic credentials)                  │"
+echo "│  ├── PKI (certificate generation)                          │"
+echo "│  └── AWS (dynamic AWS credentials)                         │"
+echo "├─────────────────────────────────────────────────────────────┤"
+echo "│  STORAGE BACKEND                                            │"
+echo "│  └── File Storage (/opt/vault/data)                        │"
+echo "└─────────────────────────────────────────────────────────────┘"
+echo ""
+
+echo "Current Configuration Summary:"
+echo "- Server: Running on localhost:8200"
+echo "- Storage: File-based at /opt/vault/data"
+echo "- Secrets Engines: $(vault secrets list | wc -l) enabled"
+echo "- Auth Methods: $(vault auth list | wc -l) enabled"
+echo "- Policies: $(vault policy list | wc -l) configured"
+EOF
+
+chmod +x create-architecture-map.sh
+./create-architecture-map.sh
+Subtask 4.4: Performance and Monitoring
+Step 1: Enable Audit Logging
+
+# Enable file audit device
+vault audit enable file file_path=/var/log/vault-audit.log
+
+# Create the log file with proper permissions
+sudo touch /var/log/vault-audit.log
+sudo chmod 640 /var/log/vault-audit.log
+
+# Test audit logging by performing some operations
+vault kv put myapp/audit-test timestamp="$(date)" action="audit-test"
+vault kv get myapp/audit-test
+
+# Check audit log
+sudo tail -5 /var/log/vault-audit.log | jq '.'
+Step 2: Monitor Vault Metrics
+
+# Create monitoring script
+tee vault-monitoring.sh > /dev/null <<'EOF'
+#!/bin/bash
+echo "=== Vault Monitoring Dashboard ==="
+echo ""
+
+echo "System Status:"
+vault status
+echo ""
+
+echo "Performance Metrics:"
+echo "- Uptime: $(ps -o etime= -p $(pgrep vault))"
+echo "- Memory Usage: $(ps -o rss= -p $(pgrep vault)) KB"
+echo "- Storage Size: $(du -sh /opt/vault/data | cut -f1)"
+echo ""
+
+echo "Security Status:"
+echo "- Sealed: $(vault status -format=json | jq -r '.sealed')"
+echo "- Version: $(vault status -format=json | jq -r '.version')"
+echo "- Cluster: $(vault status -format=json | jq -r '.ha_enabled')"
+echo ""
+
+echo "Active Components:"
+echo "- Secrets Engines: $(vault secrets list | grep -v "^Path" | grep -v "^----" | wc -l)"
+echo "- Auth Methods: $(vault auth list | grep -v "^Path" | grep -v "^----" | wc -l)"
+echo "- Policies: $(vault policy list | wc -l)"
+echo ""
+
+echo "Recent Activity (last 5 audit entries):"
+sudo tail -5 /var/log/vault-audit.log 2>/dev/null | jq -r '.time + " - " + .request.operation + " " + .request.path' || echo "No audit log available"
+EOF
+
+chmod +x vault-monitoring.sh
+./vault-monitoring.sh
+Troubleshooting Common Issues
+Issue 1: Vault Server Won't Start
+# Check if port is already in use
+netstat -tlnp | grep :8200
+
+# Check configuration syntax
+vault server -config=/etc/vault.d/vault.hcl -test
+
+# Check permissions on data directory
+ls -la /opt/vault/data
+sudo chown -R $(whoami):$(whoami) /opt/vault/data
+Issue 2: Cannot Unseal Vault
+# Check seal status
+vault status
+
+# Verify unseal keys are correct
+cat vault-init.txt
+
+# Try unsealing step by step
+vault operator unseal [KEY1]
+vault operator unseal [KEY2]
+vault operator unseal [KEY3]
+Issue 3: Permission Denied Errors
+# Check current token capabilities
+vault token lookup
+
+# Verify policy permissions
+vault policy read [policy-name]
+
+# Re-authenticate if needed
+vault auth [token]
+Lab Cleanup
+# Stop all services
+pkill vault
+pkill consul
+sudo systemctl stop mysql
+
+# Remove temporary files
+rm -f vault-*.txt cert_output.json *.crt *.key
+rm -f *.sh *.zip
+
+# Optional: Remove installed packages
+# sudo apt remove -y mysql-server consul vault
+Conclusion
+In this comprehensive lab, you have successfully explored and understood the core architecture of HashiCorp Vault. You have accomplished the following key learning objectives:
+
+Core Components Mastery: You learned about Vault's server architecture, including initialization, unsealing, and basic server operations. You understand how the Vault server manages security and coordinates all other components.
+
+Storage Backend Expertise: You configured and worked with multiple storage backends, including file-based storage and Consul. You understand how Vault persists data and the trade-offs between different storage options.
+
+Secrets Engine Proficiency: You implemented and managed four different types of secrets engines:
+
+Key-Value (KV) for static secrets storage
+Database for dynamic credential generation
+PKI for certificate management
+AWS for cloud credential management
+Architectural Understanding: You gained deep insights into how Vault components interact, including the authentication flow, policy-based authorization, and the logical path structure that organizes all Vault resources.
+
+Practical Skills: You developed hands-on experience with Vault configuration, monitoring, troubleshooting, and security best practices.
+
+This knowledge is crucial for implementing secure secret management in production environments. Vault's modular architecture allows organizations to customize their secret management strategy based on specific security requirements, compliance needs, and operational constraints. The skills you've developed in this lab provide a solid foundation for advanced Vault implementations, including high availability configurations, advanced authentication methods, and enterprise features.
+
+Understanding Vault's architecture enables you to make informed decisions about secret management strategies, troubleshoot issues effectively, and design secure, scalable solutions for modern infrastructure and application security needs.
