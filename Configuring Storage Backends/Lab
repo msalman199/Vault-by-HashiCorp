@@ -1,0 +1,938 @@
+Configuring Storage Backends
+Lab Objectives
+By the end of this lab, students will be able to:
+
+Understand the importance of persistent storage backends for HashiCorp Vault
+Configure Vault with Consul storage backend for high availability
+Set up Vault with file-based storage backend for development environments
+Compare different storage backend options and their use cases
+Implement proper security configurations for storage backends
+Verify storage backend functionality through practical testing
+Prerequisites
+Before starting this lab, students should have:
+
+Basic understanding of Linux command line operations
+Familiarity with text editors (nano, vim, or similar)
+Knowledge of basic networking concepts
+Understanding of JSON configuration files
+Previous experience with HashiCorp Vault basics (recommended)
+Lab Environment Setup
+Note: Al Nafi provides Linux-based cloud machines for this lab. Simply click "Start Lab" to access your dedicated Linux machine. The provided machine is bare metal with no pre-installed tools, so you will install all required software during the lab exercises.
+
+All tasks in this lab will be performed on a single Linux machine. No additional virtual machines or remote hosts are required.
+
+Task 1: Environment Preparation and Initial Setup
+Subtask 1.1: Update System and Install Dependencies
+First, update your system and install necessary packages:
+
+# Update package repositories
+sudo apt update && sudo apt upgrade -y
+
+# Install required packages
+sudo apt install -y wget curl unzip jq net-tools
+
+# Create working directory
+mkdir -p ~/vault-lab
+cd ~/vault-lab
+Subtask 1.2: Install HashiCorp Vault
+Download and install the latest version of Vault:
+
+# Download Vault (check for latest version at releases.hashicorp.com)
+wget https://releases.hashicorp.com/vault/1.15.2/vault_1.15.2_linux_amd64.zip
+
+# Unzip and install
+unzip vault_1.15.2_linux_amd64.zip
+sudo mv vault /usr/local/bin/
+
+# Verify installation
+vault version
+
+# Enable command completion
+vault -autocomplete-install
+Subtask 1.3: Install Consul for Storage Backend
+Download and install Consul:
+
+# Download Consul
+wget https://releases.hashicorp.com/consul/1.16.1/consul_1.16.1_linux_amd64.zip
+
+# Unzip and install
+unzip consul_1.16.1_linux_amd64.zip
+sudo mv consul /usr/local/bin/
+
+# Verify installation
+consul version
+
+# Create consul user and directories
+sudo useradd --system --home /etc/consul.d --shell /bin/false consul
+sudo mkdir -p /opt/consul /etc/consul.d
+sudo chown -R consul:consul /opt/consul /etc/consul.d
+Task 2: Configure File-Based Storage Backend
+Subtask 2.1: Create File Storage Configuration
+Create a basic Vault configuration using file storage:
+
+# Create configuration directory
+mkdir -p ~/vault-lab/config
+
+# Create file storage configuration
+cat > ~/vault-lab/config/vault-file.hcl << 'EOF'
+# Vault configuration with file storage backend
+storage "file" {
+  path = "/opt/vault/data"
+}
+
+listener "tcp" {
+  address     = "127.0.0.1:8200"
+  tls_disable = 1
+}
+
+api_addr = "http://127.0.0.1:8200"
+cluster_addr = "https://127.0.0.1:8201"
+ui = true
+
+# Disable mlock for development
+disable_mlock = true
+EOF
+Subtask 2.2: Prepare File Storage Directory
+Set up the storage directory with proper permissions:
+
+# Create storage directory
+sudo mkdir -p /opt/vault/data
+
+# Set proper ownership and permissions
+sudo chown -R $USER:$USER /opt/vault
+chmod 755 /opt/vault
+chmod 700 /opt/vault/data
+Subtask 2.3: Start Vault with File Storage
+Initialize and start Vault with file storage:
+
+# Start Vault server in background
+vault server -config=~/vault-lab/config/vault-file.hcl > ~/vault-lab/vault-file.log 2>&1 &
+
+# Wait for server to start
+sleep 5
+
+# Set environment variable
+export VAULT_ADDR='http://127.0.0.1:8200'
+
+# Check server status
+vault status
+Subtask 2.4: Initialize and Unseal Vault
+Initialize the Vault and save the keys:
+
+# Initialize Vault
+vault operator init -key-shares=5 -key-threshold=3 > ~/vault-lab/vault-keys.txt
+
+# Display the keys (save these securely in production)
+cat ~/vault-lab/vault-keys.txt
+
+# Extract unseal keys and root token
+UNSEAL_KEY_1=$(grep 'Unseal Key 1:' ~/vault-lab/vault-keys.txt | awk '{print $4}')
+UNSEAL_KEY_2=$(grep 'Unseal Key 2:' ~/vault-lab/vault-keys.txt | awk '{print $4}')
+UNSEAL_KEY_3=$(grep 'Unseal Key 3:' ~/vault-lab/vault-keys.txt | awk '{print $4}')
+ROOT_TOKEN=$(grep 'Initial Root Token:' ~/vault-lab/vault-keys.txt | awk '{print $4}')
+
+# Unseal Vault
+vault operator unseal $UNSEAL_KEY_1
+vault operator unseal $UNSEAL_KEY_2
+vault operator unseal $UNSEAL_KEY_3
+
+# Authenticate with root token
+vault auth $ROOT_TOKEN
+Subtask 2.5: Test File Storage Backend
+Verify that data is being stored in the file system:
+
+# Enable KV secrets engine
+vault secrets enable -path=secret kv-v2
+
+# Store a test secret
+vault kv put secret/test-file username="fileuser" password="filepass123"
+
+# Verify secret storage
+vault kv get secret/test-file
+
+# Check physical storage
+ls -la /opt/vault/data/
+find /opt/vault/data/ -type f | head -10
+Subtask 2.6: Stop File Storage Vault
+Stop the current Vault instance:
+
+# Find and kill Vault process
+pkill vault
+
+# Verify it's stopped
+vault status || echo "Vault is stopped"
+Task 3: Configure Consul Storage Backend
+Subtask 3.1: Configure Consul Server
+Create Consul configuration:
+
+# Create Consul configuration
+cat > ~/vault-lab/config/consul.hcl << 'EOF'
+datacenter = "dc1"
+data_dir = "/opt/consul"
+log_level = "INFO"
+server = true
+bootstrap_expect = 1
+bind_addr = "127.0.0.1"
+client_addr = "127.0.0.1"
+retry_join = ["127.0.0.1"]
+ui_config {
+  enabled = true
+}
+connect {
+  enabled = true
+}
+ports {
+  grpc = 8502
+}
+EOF
+
+# Create data directory
+sudo mkdir -p /opt/consul
+sudo chown -R consul:consul /opt/consul
+Subtask 3.2: Start Consul Server
+Start the Consul server:
+
+# Start Consul server
+sudo -u consul consul agent -config-file=~/vault-lab/config/consul.hcl > ~/vault-lab/consul.log 2>&1 &
+
+# Wait for Consul to start
+sleep 10
+
+# Verify Consul is running
+consul members
+consul catalog services
+Subtask 3.3: Create Vault Configuration with Consul Backend
+Create Vault configuration using Consul storage:
+
+# Create Consul storage configuration
+cat > ~/vault-lab/config/vault-consul.hcl << 'EOF'
+# Vault configuration with Consul storage backend
+storage "consul" {
+  address = "127.0.0.1:8500"
+  path    = "vault/"
+}
+
+listener "tcp" {
+  address     = "127.0.0.1:8200"
+  tls_disable = 1
+}
+
+api_addr = "http://127.0.0.1:8200"
+cluster_addr = "https://127.0.0.1:8201"
+ui = true
+
+# Disable mlock for development
+disable_mlock = true
+EOF
+Subtask 3.4: Start Vault with Consul Storage
+Start Vault with the new configuration:
+
+# Start Vault server with Consul backend
+vault server -config=~/vault-lab/config/vault-consul.hcl > ~/vault-lab/vault-consul.log 2>&1 &
+
+# Wait for server to start
+sleep 5
+
+# Check server status
+vault status
+Subtask 3.5: Initialize Vault with Consul Backend
+Since this is a new storage backend, initialize Vault again:
+
+# Initialize Vault (new storage backend requires new initialization)
+vault operator init -key-shares=5 -key-threshold=3 > ~/vault-lab/vault-consul-keys.txt
+
+# Extract keys for unsealing
+CONSUL_UNSEAL_KEY_1=$(grep 'Unseal Key 1:' ~/vault-lab/vault-consul-keys.txt | awk '{print $4}')
+CONSUL_UNSEAL_KEY_2=$(grep 'Unseal Key 2:' ~/vault-lab/vault-consul-keys.txt | awk '{print $4}')
+CONSUL_UNSEAL_KEY_3=$(grep 'Unseal Key 3:' ~/vault-lab/vault-consul-keys.txt | awk '{print $4}')
+CONSUL_ROOT_TOKEN=$(grep 'Initial Root Token:' ~/vault-lab/vault-consul-keys.txt | awk '{print $4}')
+
+# Unseal Vault
+vault operator unseal $CONSUL_UNSEAL_KEY_1
+vault operator unseal $CONSUL_UNSEAL_KEY_2
+vault operator unseal $CONSUL_UNSEAL_KEY_3
+
+# Authenticate
+vault auth $CONSUL_ROOT_TOKEN
+Subtask 3.6: Test Consul Storage Backend
+Test the Consul storage functionality:
+
+# Enable KV secrets engine
+vault secrets enable -path=secret kv-v2
+
+# Store test secrets
+vault kv put secret/test-consul username="consuluser" password="consulpass123"
+vault kv put secret/database host="localhost" port="5432" dbname="myapp"
+
+# Verify secrets
+vault kv get secret/test-consul
+vault kv get secret/database
+
+# Check Consul KV store directly
+consul kv get -recurse vault/
+Subtask 3.7: Verify Data Persistence
+Test that data persists across Vault restarts:
+
+# Stop Vault
+pkill vault
+sleep 3
+
+# Restart Vault with same configuration
+vault server -config=~/vault-lab/config/vault-consul.hcl > ~/vault-lab/vault-consul-restart.log 2>&1 &
+sleep 5
+
+# Unseal Vault again
+vault operator unseal $CONSUL_UNSEAL_KEY_1
+vault operator unseal $CONSUL_UNSEAL_KEY_2
+vault operator unseal $CONSUL_UNSEAL_KEY_3
+
+# Authenticate and verify data persistence
+vault auth $CONSUL_ROOT_TOKEN
+vault kv get secret/test-consul
+vault kv get secret/database
+Task 4: Compare Storage Backends and Performance Testing
+Subtask 4.1: Create Performance Test Script
+Create a script to test storage backend performance:
+
+# Create performance test script
+cat > ~/vault-lab/storage-performance-test.sh << 'EOF'
+#!/bin/bash
+
+echo "Storage Backend Performance Test"
+echo "================================"
+
+# Function to test write performance
+test_write_performance() {
+    local backend_name=$1
+    local num_secrets=$2
+    
+    echo "Testing $backend_name - Writing $num_secrets secrets..."
+    start_time=$(date +%s.%N)
+    
+    for i in $(seq 1 $num_secrets); do
+        vault kv put secret/perf-test/secret-$i \
+            username="user$i" \
+            password="pass$i" \
+            data="test-data-$i" > /dev/null 2>&1
+    done
+    
+    end_time=$(date +%s.%N)
+    duration=$(echo "$end_time - $start_time" | bc -l)
+    
+    echo "$backend_name Write Performance: $duration seconds for $num_secrets secrets"
+    echo "Average per secret: $(echo "scale=4; $duration / $num_secrets" | bc -l) seconds"
+}
+
+# Function to test read performance
+test_read_performance() {
+    local backend_name=$1
+    local num_secrets=$2
+    
+    echo "Testing $backend_name - Reading $num_secrets secrets..."
+    start_time=$(date +%s.%N)
+    
+    for i in $(seq 1 $num_secrets); do
+        vault kv get secret/perf-test/secret-$i > /dev/null 2>&1
+    done
+    
+    end_time=$(date +%s.%N)
+    duration=$(echo "$end_time - $start_time" | bc -l)
+    
+    echo "$backend_name Read Performance: $duration seconds for $num_secrets secrets"
+    echo "Average per secret: $(echo "scale=4; $duration / $num_secrets" | bc -l) seconds"
+}
+
+# Check if bc is installed
+if ! command -v bc &> /dev/null; then
+    echo "Installing bc for calculations..."
+    sudo apt install -y bc
+fi
+
+# Test current backend
+if vault status > /dev/null 2>&1; then
+    echo "Current Vault Status:"
+    vault status | grep "Storage Type"
+    echo ""
+    
+    # Run performance tests
+    test_write_performance "Current Backend" 10
+    echo ""
+    test_read_performance "Current Backend" 10
+    echo ""
+else
+    echo "Vault is not running or accessible"
+fi
+EOF
+
+# Make script executable
+chmod +x ~/vault-lab/storage-performance-test.sh
+Subtask 4.2: Run Performance Tests
+Execute performance tests on the Consul backend:
+
+# Run performance test
+~/vault-lab/storage-performance-test.sh
+Subtask 4.3: Create Storage Backend Comparison
+Create a comparison document:
+
+# Create comparison file
+cat > ~/vault-lab/storage-backend-comparison.md << 'EOF'
+# Vault Storage Backend Comparison
+
+## File Storage Backend
+
+### Advantages:
+- Simple setup and configuration
+- No external dependencies
+- Good for development and testing
+- Fast local access
+- Easy backup (just copy files)
+
+### Disadvantages:
+- No high availability
+- Single point of failure
+- Not suitable for production clusters
+- Limited scalability
+- No built-in replication
+
+### Use Cases:
+- Development environments
+- Testing and proof of concepts
+- Single-node deployments
+- Local development
+
+## Consul Storage Backend
+
+### Advantages:
+- High availability and clustering support
+- Built-in replication and consistency
+- Service discovery integration
+- Mature and battle-tested
+- Supports multi-datacenter deployments
+
+### Disadvantages:
+- Additional complexity
+- Requires Consul cluster management
+- Network dependency
+- Slightly higher latency than file storage
+
+### Use Cases:
+- Production environments
+- High availability requirements
+- Multi-node Vault clusters
+- Integration with Consul service mesh
+
+## Performance Observations:
+- File storage: Faster for single-node operations
+- Consul storage: Better for distributed operations
+- Network latency affects Consul performance
+- File storage has lower resource overhead
+EOF
+
+# Display comparison
+cat ~/vault-lab/storage-backend-comparison.md
+Task 5: Advanced Configuration and Security
+Subtask 5.1: Configure Storage Backend Security
+Enhance Consul storage security:
+
+# Stop current Vault instance
+pkill vault
+sleep 3
+
+# Create secure Consul configuration
+cat > ~/vault-lab/config/consul-secure.hcl << 'EOF'
+datacenter = "dc1"
+data_dir = "/opt/consul"
+log_level = "INFO"
+server = true
+bootstrap_expect = 1
+bind_addr = "127.0.0.1"
+client_addr = "127.0.0.1"
+retry_join = ["127.0.0.1"]
+
+# Enable ACLs
+acl = {
+  enabled = true
+  default_policy = "deny"
+  enable_token_persistence = true
+}
+
+ui_config {
+  enabled = true
+}
+
+connect {
+  enabled = true
+}
+
+ports {
+  grpc = 8502
+}
+EOF
+
+# Restart Consul with ACLs
+sudo pkill consul
+sleep 3
+sudo -u consul consul agent -config-file=~/vault-lab/config/consul-secure.hcl > ~/vault-lab/consul-secure.log 2>&1 &
+sleep 10
+
+# Bootstrap ACL system
+consul acl bootstrap > ~/vault-lab/consul-bootstrap.txt
+CONSUL_TOKEN=$(grep 'SecretID:' ~/vault-lab/consul-bootstrap.txt | awk '{print $2}')
+
+echo "Consul Bootstrap Token: $CONSUL_TOKEN"
+Subtask 5.2: Create Vault-Specific Consul Policy
+Create a dedicated policy for Vault:
+
+# Set Consul token
+export CONSUL_HTTP_TOKEN=$CONSUL_TOKEN
+
+# Create Vault policy
+cat > ~/vault-lab/vault-consul-policy.hcl << 'EOF'
+key_prefix "vault/" {
+  policy = "write"
+}
+
+node_prefix "" {
+  policy = "write"
+}
+
+service "vault" {
+  policy = "write"
+}
+
+agent_prefix "" {
+  policy = "write"
+}
+
+session_prefix "" {
+  policy = "write"
+}
+EOF
+
+# Apply the policy
+consul acl policy create -name "vault-policy" -description "Policy for Vault" -rules @~/vault-lab/vault-consul-policy.hcl
+
+# Create token for Vault
+consul acl token create -description "Vault Token" -policy-name "vault-policy" > ~/vault-lab/vault-consul-token.txt
+VAULT_CONSUL_TOKEN=$(grep 'SecretID:' ~/vault-lab/vault-consul-token.txt | awk '{print $2}')
+
+echo "Vault Consul Token: $VAULT_CONSUL_TOKEN"
+Subtask 5.3: Configure Vault with Secure Consul Backend
+Update Vault configuration to use the secure token:
+
+# Create secure Vault configuration
+cat > ~/vault-lab/config/vault-consul-secure.hcl << 'EOF'
+storage "consul" {
+  address = "127.0.0.1:8500"
+  path    = "vault/"
+  token   = "VAULT_CONSUL_TOKEN_PLACEHOLDER"
+}
+
+listener "tcp" {
+  address     = "127.0.0.1:8200"
+  tls_disable = 1
+}
+
+api_addr = "http://127.0.0.1:8200"
+cluster_addr = "https://127.0.0.1:8201"
+ui = true
+disable_mlock = true
+EOF
+
+# Replace placeholder with actual token
+sed -i "s/VAULT_CONSUL_TOKEN_PLACEHOLDER/$VAULT_CONSUL_TOKEN/g" ~/vault-lab/config/vault-consul-secure.hcl
+
+# Start Vault with secure configuration
+vault server -config=~/vault-lab/config/vault-consul-secure.hcl > ~/vault-lab/vault-secure.log 2>&1 &
+sleep 5
+
+# Unseal Vault (using previous keys since same storage path)
+vault operator unseal $CONSUL_UNSEAL_KEY_1
+vault operator unseal $CONSUL_UNSEAL_KEY_2
+vault operator unseal $CONSUL_UNSEAL_KEY_3
+
+# Authenticate and test
+vault auth $CONSUL_ROOT_TOKEN
+vault kv get secret/test-consul
+Task 6: Backup and Recovery Testing
+Subtask 6.1: Create Backup Scripts
+Create backup scripts for both storage backends:
+
+# Create file storage backup script
+cat > ~/vault-lab/backup-file-storage.sh << 'EOF'
+#!/bin/bash
+
+BACKUP_DIR="$HOME/vault-lab/backups/file-storage"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+echo "Creating file storage backup..."
+mkdir -p "$BACKUP_DIR"
+
+# Stop Vault to ensure consistent backup
+echo "Stopping Vault for consistent backup..."
+pkill vault
+sleep 3
+
+# Create backup
+tar -czf "$BACKUP_DIR/vault-file-backup-$TIMESTAMP.tar.gz" -C /opt/vault data/
+
+echo "File storage backup created: $BACKUP_DIR/vault-file-backup-$TIMESTAMP.tar.gz"
+ls -lh "$BACKUP_DIR/vault-file-backup-$TIMESTAMP.tar.gz"
+EOF
+
+# Create Consul storage backup script
+cat > ~/vault-lab/backup-consul-storage.sh << 'EOF'
+#!/bin/bash
+
+BACKUP_DIR="$HOME/vault-lab/backups/consul-storage"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+echo "Creating Consul storage backup..."
+mkdir -p "$BACKUP_DIR"
+
+# Create Consul snapshot
+consul snapshot save "$BACKUP_DIR/consul-backup-$TIMESTAMP.snap"
+
+echo "Consul storage backup created: $BACKUP_DIR/consul-backup-$TIMESTAMP.snap"
+ls -lh "$BACKUP_DIR/consul-backup-$TIMESTAMP.snap"
+EOF
+
+# Make scripts executable
+chmod +x ~/vault-lab/backup-file-storage.sh
+chmod +x ~/vault-lab/backup-consul-storage.sh
+Subtask 6.2: Test Backup and Recovery
+Test the backup and recovery process:
+
+# Create backup directories
+mkdir -p ~/vault-lab/backups/{file-storage,consul-storage}
+
+# Create Consul backup
+~/vault-lab/backup-consul-storage.sh
+
+# Add some test data before backup
+vault kv put secret/backup-test data="before-backup" timestamp="$(date)"
+
+# Create another backup
+~/vault-lab/backup-consul-storage.sh
+
+# Verify backups exist
+ls -la ~/vault-lab/backups/consul-storage/
+Task 7: Monitoring and Troubleshooting
+Subtask 7.1: Create Monitoring Script
+Create a script to monitor storage backend health:
+
+# Create monitoring script
+cat > ~/vault-lab/monitor-storage.sh << 'EOF'
+#!/bin/bash
+
+echo "Vault Storage Backend Health Monitor"
+echo "===================================="
+echo "Timestamp: $(date)"
+echo ""
+
+# Check Vault status
+echo "1. Vault Status:"
+if vault status > /dev/null 2>&1; then
+    vault status | grep -E "(Sealed|Version|Storage Type|Cluster Name)"
+    echo "   Status: HEALTHY"
+else
+    echo "   Status: UNHEALTHY - Vault not accessible"
+fi
+echo ""
+
+# Check Consul status (if using Consul backend)
+echo "2. Consul Status:"
+if consul members > /dev/null 2>&1; then
+    echo "   Consul Members:"
+    consul members
+    echo "   Consul Services:"
+    consul catalog services
+    echo "   Status: HEALTHY"
+else
+    echo "   Status: UNHEALTHY - Consul not accessible"
+fi
+echo ""
+
+# Check storage connectivity
+echo "3. Storage Connectivity Test:"
+if vault kv put secret/health-check timestamp="$(date)" > /dev/null 2>&1; then
+    echo "   Write Test: PASSED"
+    if vault kv get secret/health-check > /dev/null 2>&1; then
+        echo "   Read Test: PASSED"
+        vault kv delete secret/health-check > /dev/null 2>&1
+        echo "   Delete Test: PASSED"
+    else
+        echo "   Read Test: FAILED"
+    fi
+else
+    echo "   Write Test: FAILED"
+fi
+echo ""
+
+# Check disk usage (for file storage)
+echo "4. Storage Disk Usage:"
+if [ -d "/opt/vault/data" ]; then
+    echo "   File Storage Usage:"
+    du -sh /opt/vault/data
+fi
+if [ -d "/opt/consul" ]; then
+    echo "   Consul Storage Usage:"
+    du -sh /opt/consul
+fi
+echo ""
+
+# Check process status
+echo "5. Process Status:"
+echo "   Vault Process:"
+pgrep -f vault > /dev/null && echo "     Running (PID: $(pgrep -f vault))" || echo "     Not Running"
+echo "   Consul Process:"
+pgrep -f consul > /dev/null && echo "     Running (PID: $(pgrep -f consul))" || echo "     Not Running"
+echo ""
+
+echo "Health check completed."
+EOF
+
+# Make script executable
+chmod +x ~/vault-lab/monitor-storage.sh
+
+# Run monitoring script
+~/vault-lab/monitor-storage.sh
+Subtask 7.2: Create Troubleshooting Guide
+Create a troubleshooting reference:
+
+# Create troubleshooting guide
+cat > ~/vault-lab/troubleshooting-guide.md << 'EOF'
+# Vault Storage Backend Troubleshooting Guide
+
+## Common Issues and Solutions
+
+### 1. Vault Won't Start
+
+**Symptoms:**
+- Vault server fails to start
+- Connection refused errors
+
+**Possible Causes & Solutions:**
+- Check configuration file syntax: `vault server -config=config.hcl -test`
+- Verify storage backend is accessible
+- Check port availability: `netstat -tulpn | grep 8200`
+- Review logs for specific errors
+
+### 2. Storage Backend Connection Issues
+
+**File Storage:**
+- Verify directory permissions: `ls -la /opt/vault/data`
+- Check disk space: `df -h /opt/vault`
+- Ensure directory is writable
+
+**Consul Storage:**
+- Verify Consul is running: `consul members`
+- Check network connectivity: `curl http://127.0.0.1:8500/v1/status/leader`
+- Verify ACL tokens if using security
+
+### 3. Performance Issues
+
+**Symptoms:**
+- Slow response times
+- Timeouts
+
+**Solutions:**
+- Monitor system resources: `top`, `iostat`
+- Check network latency (for Consul)
+- Review Vault and storage backend logs
+- Consider storage backend tuning
+
+### 4. Data Consistency Issues
+
+**Symptoms:**
+- Missing or corrupted data
+- Inconsistent reads
+
+**Solutions:**
+- Verify backup integrity
+- Check storage backend health
+- Review replication status (for distributed backends)
+- Consider storage backend repair tools
+
+## Log Locations
+
+- Vault logs: `~/vault-lab/vault-*.log`
+- Consul logs: `~/vault-lab/consul*.log`
+- System logs: `/var/log/syslog`
+
+## Useful Commands
+
+```bash
+# Check Vault status
+vault status
+
+# Check storage backend health
+vault operator raft list-peers  # For raft backend
+consul members                  # For consul backend
+
+# View recent logs
+tail -f ~/vault-lab/vault-consul.log
+
+# Test storage connectivity
+vault kv put secret/test key=value
+vault kv get secret/test
+EOF
+
+Display troubleshooting guide
+cat ~/vault-lab/troubleshooting-guide.md
+
+
+## Task 8: Cleanup and Documentation
+
+### Subtask 8.1: Create Lab Summary
+
+Document what was accomplished:
+
+```bash
+# Create lab summary
+cat > ~/vault-lab/lab-summary.md << 'EOF'
+# Lab 4: Configuring Storage Backends - Summary
+
+## Completed Tasks
+
+### 1. Environment Setup
+- Installed HashiCorp Vault and Consul
+- Configured system dependencies
+- Created working directories
+
+### 2. File Storage Backend
+- Configured Vault with file-based storage
+- Tested data persistence
+- Evaluated performance characteristics
+
+### 3. Consul Storage Backend
+- Set up Consul server
+- Configured Vault with Consul storage
+- Implemented high availability features
+
+### 4. Security Configuration
+- Enabled Consul ACLs
+- Created dedicated Vault policies
+- Implemented secure token authentication
+
+### 5. Performance Testing
+- Created performance benchmarking scripts
+- Compared storage backend performance
+- Documented findings
+
+### 6. Backup and Recovery
+- Implemented backup strategies
+- Tested recovery procedures
+- Created automated backup scripts
+
+### 7. Monitoring and Troubleshooting
+- Created health monitoring scripts
+- Developed troubleshooting procedures
+- Documented common issues and solutions
+
+## Key Files Created
+
+- Configuration files: `~/vault-lab/config/`
+- Backup scripts: `~/vault-lab/backup-*.sh`
+- Monitoring script: `~/vault-lab/monitor-storage.sh`
+- Performance test: `~/vault-lab/storage-performance-test.sh`
+- Documentation: `~/vault-lab/*.md`
+
+## Storage Backend Comparison Results
+
+| Feature | File Storage | Consul Storage |
+|---------|-------------|----------------|
+| Setup Complexity | Low | Medium |
+| High Availability | No | Yes |
+| Performance | High (local) | Medium (network) |
+| Scalability | Limited | High |
+| Production Ready | No | Yes |
+
+## Next Steps
+
+- Explore additional storage backends (AWS S3, PostgreSQL)
+- Implement TLS encryption
+- Set up multi-node Vault clusters
+- Integrate with monitoring systems
+EOF
+
+# Display summary
+cat ~/vault-lab/lab-summary.md
+Subtask 8.2: Clean Up Resources
+Create cleanup script for lab resources:
+
+# Create cleanup script
+cat > ~/vault-lab/cleanup-lab.sh << 'EOF'
+#!/bin/bash
+
+echo "Cleaning up Lab 4 resources..."
+
+# Stop running processes
+echo "Stopping Vault and Consul processes..."
+pkill vault
+pkill consul
+sleep 5
+
+# Remove data directories (optional - comment out to preserve data)
+echo "Removing data directories..."
+sudo rm -rf /opt/vault/data/*
+sudo rm -rf /opt/consul/*
+
+# Keep configuration and scripts for reference
+echo "Keeping configuration files and scripts in ~/vault-lab/"
+
+echo "Cleanup completed. Configuration files and logs preserved."
+echo "To completely remove all lab files, run: rm -rf ~/vault-lab/"
+EOF
+
+# Make cleanup script executable
+chmod +x ~/vault-lab/cleanup-lab.sh
+
+echo "Cleanup script created. Run ~/vault-lab/cleanup-lab.sh when ready to clean up."
+Subtask 8.3: Final Verification
+Perform final verification of lab completion:
+
+# Run final monitoring check
+echo "Final Lab Verification:"
+echo "======================"
+
+# Check if all key files exist
+echo "1. Checking configuration files..."
+ls -la ~/vault-lab/config/
+
+echo "2. Checking backup capabilities..."
+ls -la ~/vault-lab/backup-*.sh
+
+echo "3. Checking monitoring tools..."
+ls -la ~/vault-lab/monitor-storage.sh
+
+echo "4. Running final health check..."
+~/vault-lab/monitor-storage.sh
+
+echo "5. Verifying storage backend functionality..."
+if vault status > /dev/null 2>&1; then
+    vault kv put secret/final-test completion="success" timestamp="$(date)"
+    vault kv get secret/final-test
+    echo "Storage backend test: PASSED"
+else
+    echo "Storage backend test: Vault not accessible"
+fi
+
+echo ""
+echo "Lab 4 verification completed!"
+Conclusion
+In this comprehensive lab, you have successfully:
+
+Mastered Storage Backend Configuration: You learned to configure HashiCorp Vault with multiple storage backends, including file-based storage for development environments and Consul storage for production-ready high availability setups.
+
+Implemented Security Best Practices: You configured secure authentication between Vault and Consul using ACL tokens and policies, ensuring that storage backend communications are properly secured.
+
+Developed Operational Skills: You created monitoring scripts, backup procedures, and troubleshooting guides that are essential for maintaining Vault in production environments.
+
+Gained Performance Insights: Through hands-on testing, you compared the performance characteristics of different storage backends and understand when to use each option based on specific requirements.
+
+Built Production-Ready Solutions: You implemented high availability configurations with Consul that can scale to support enterprise-level Vault deployments.
+
+This lab has provided you with practical experience in one of the most critical aspects of Vault deployment - choosing and configuring the appropriate storage backend. The skills you've developed here form the foundation for building robust, scalable, and secure secret management infrastructure.
+
+The storage backend choice significantly impacts Vault's availability, performance, and operational characteristics. File storage is excellent for development and testing, while Consul storage provides the distributed capabilities needed for production environments. Understanding these trade-offs and being able to implement both options makes you well-prepared to design Vault architectures that meet diverse organizational needs.
