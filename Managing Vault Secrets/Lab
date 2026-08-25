@@ -1,0 +1,424 @@
+Managing Vault Secrets
+Lab Objectives
+By the end of this lab, you will be able to:
+
+Install and configure HashiCorp Vault on a Linux machine
+Initialize and unseal a Vault instance
+Enable and configure the Key-Value (KV) secrets engine
+Store, retrieve, and manage secrets using Vault's KV secrets engine
+Implement versioned secrets with KV version 2
+Understand the difference between KV version 1 and version 2
+Perform secret versioning operations including rollback and deletion
+Apply security best practices for secret management
+Prerequisites
+Before starting this lab, you should have:
+
+Basic understanding of Linux command line operations
+Familiarity with JSON format and basic data structures
+Understanding of secret management concepts
+Knowledge of HTTP methods (GET, POST, PUT, DELETE)
+Basic understanding of API interactions
+Lab Environment
+Al Nafi provides Linux-based cloud machines for this lab. Simply click Start Lab to access your dedicated Linux environment. The provided machine is bare metal with no pre-installed tools, so you will install all required software during the lab exercises.
+
+Note: All tasks in this lab will be performed on a single Linux machine. No additional virtual machines or remote hosts are required.
+
+Task 1: Install and Configure HashiCorp Vault
+Subtask 1.1: Install Vault
+First, we need to install HashiCorp Vault on our Linux machine.
+
+Update the system package manager:
+sudo apt update
+Install required dependencies:
+sudo apt install -y wget unzip curl
+Download the latest Vault binary:
+wget https://releases.hashicorp.com/vault/1.15.2/vault_1.15.2_linux_amd64.zip
+Extract the Vault binary:
+unzip vault_1.15.2_linux_amd64.zip
+Move Vault to a directory in your PATH:
+sudo mv vault /usr/local/bin/
+Verify the installation:
+vault version
+You should see output similar to:
+
+Vault v1.15.2 (build date)
+Subtask 1.2: Create Vault Configuration
+Create a directory for Vault configuration and data:
+sudo mkdir -p /opt/vault/data
+sudo mkdir -p /opt/vault/config
+Create a Vault configuration file:
+sudo tee /opt/vault/config/vault.hcl > /dev/null <<EOF
+storage "file" {
+  path = "/opt/vault/data"
+}
+
+listener "tcp" {
+  address = "127.0.0.1:8200"
+  tls_disable = true
+}
+
+ui = true
+disable_mlock = true
+EOF
+Set appropriate permissions:
+sudo chown -R $USER:$USER /opt/vault
+Subtask 1.3: Start Vault Server
+Start the Vault server in development mode for this lab:
+vault server -config=/opt/vault/config/vault.hcl &
+Set the Vault address environment variable:
+export VAULT_ADDR='http://127.0.0.1:8200'
+Verify the server is running:
+vault status
+You should see that the server is running but sealed.
+
+Task 2: Initialize and Unseal Vault
+Subtask 2.1: Initialize Vault
+Initialize Vault with 5 key shares and a threshold of 3:
+vault operator init -key-shares=5 -key-threshold=3
+Important: Save the unseal keys and root token that are displayed. You will need them for the next steps.
+
+Example output:
+
+Unseal Key 1: [key1]
+Unseal Key 2: [key2]
+Unseal Key 3: [key3]
+Unseal Key 4: [key4]
+Unseal Key 5: [key5]
+
+Initial Root Token: [root_token]
+Store the root token in an environment variable (replace with your actual token):
+export VAULT_TOKEN="your_root_token_here"
+Subtask 2.2: Unseal Vault
+Unseal Vault using three of the five unseal keys:
+vault operator unseal [unseal_key_1]
+vault operator unseal [unseal_key_2]
+vault operator unseal [unseal_key_3]
+Verify Vault is unsealed:
+vault status
+You should see Sealed: false in the output.
+
+Task 3: Store and Retrieve Secrets Using KV Secrets Engine
+Subtask 3.1: Enable KV Version 1 Secrets Engine
+Enable the KV version 1 secrets engine at the path secret-v1:
+vault secrets enable -path=secret-v1 kv
+List enabled secrets engines to verify:
+vault secrets list
+Subtask 3.2: Store Secrets in KV Version 1
+Store a simple database credential:
+vault kv put secret-v1/database username=admin password=secretpass123
+Store application configuration secrets:
+vault kv put secret-v1/app/config \
+  api_key=abc123def456 \
+  database_url=postgresql://localhost:5432/myapp \
+  debug_mode=false
+Store multiple environment secrets:
+vault kv put secret-v1/environments/production \
+  db_host=prod-db.company.com \
+  db_user=prod_user \
+  db_password=prod_secure_pass \
+  redis_url=redis://prod-redis:6379
+Subtask 3.3: Retrieve Secrets from KV Version 1
+Retrieve the database credentials:
+vault kv get secret-v1/database
+Retrieve specific fields from the database secret:
+vault kv get -field=username secret-v1/database
+vault kv get -field=password secret-v1/database
+Retrieve secrets in JSON format:
+vault kv get -format=json secret-v1/app/config
+List all secrets under a path:
+vault kv list secret-v1/
+vault kv list secret-v1/environments/
+Subtask 3.4: Update and Delete Secrets in KV Version 1
+Update the database password:
+vault kv put secret-v1/database username=admin password=newpassword456
+Verify the update:
+vault kv get secret-v1/database
+Delete a specific secret:
+vault kv delete secret-v1/app/config
+Verify the deletion:
+vault kv get secret-v1/app/config
+You should receive an error indicating the secret doesn't exist.
+
+Task 4: Implement Versioned Secrets with KV Version 2
+Subtask 4.1: Enable KV Version 2 Secrets Engine
+Enable the KV version 2 secrets engine:
+vault secrets enable -path=secret-v2 kv-v2
+Configure the secrets engine with version limits:
+vault write secret-v2/config max_versions=10 delete_version_after="72h"
+Verify the configuration:
+vault read secret-v2/config
+Subtask 4.2: Store Versioned Secrets
+Create the first version of an application secret:
+vault kv put secret-v2/myapp/database \
+  host=localhost \
+  port=5432 \
+  username=appuser \
+  password=version1pass
+Create a second version with updated credentials:
+vault kv put secret-v2/myapp/database \
+  host=db.example.com \
+  port=5432 \
+  username=appuser \
+  password=version2pass \
+  ssl_mode=require
+Create a third version with additional configuration:
+vault kv put secret-v2/myapp/database \
+  host=db.example.com \
+  port=5432 \
+  username=newuser \
+  password=version3pass \
+  ssl_mode=require \
+  connection_pool=20
+Subtask 4.3: Retrieve Versioned Secrets
+Get the latest version (version 3):
+vault kv get secret-v2/myapp/database
+Get a specific version (version 1):
+vault kv get -version=1 secret-v2/myapp/database
+Get version 2:
+vault kv get -version=2 secret-v2/myapp/database
+View metadata for all versions:
+vault kv metadata get secret-v2/myapp/database
+Subtask 4.4: Manage Secret Versions
+Create additional secrets for version management demonstration:
+vault kv put secret-v2/api/keys \
+  primary_key=key_v1 \
+  secondary_key=backup_v1
+
+vault kv put secret-v2/api/keys \
+  primary_key=key_v2 \
+  secondary_key=backup_v2 \
+  tertiary_key=extra_v2
+
+vault kv put secret-v2/api/keys \
+  primary_key=key_v3 \
+  secondary_key=backup_v3 \
+  tertiary_key=extra_v3
+List all versions:
+vault kv metadata get secret-v2/api/keys
+Delete a specific version (version 2):
+vault kv delete -versions=2 secret-v2/api/keys
+Verify the deletion:
+vault kv get -version=2 secret-v2/api/keys
+Undelete the version:
+vault kv undelete -versions=2 secret-v2/api/keys
+Verify the restoration:
+vault kv get -version=2 secret-v2/api/keys
+Subtask 4.5: Advanced Version Management
+Destroy a version permanently (cannot be recovered):
+vault kv destroy -versions=1 secret-v2/api/keys
+Try to retrieve the destroyed version:
+vault kv get -version=1 secret-v2/api/keys
+Rollback to a previous version by creating a new version with old data:
+# First, get the data from version 2
+vault kv get -version=2 -format=json secret-v2/api/keys
+
+# Then create a new version with that data
+vault kv put secret-v2/api/keys \
+  primary_key=key_v2 \
+  secondary_key=backup_v2 \
+  tertiary_key=extra_v2
+Set metadata for better secret management:
+vault kv metadata put -max-versions=5 secret-v2/api/keys
+vault kv metadata put -delete-version-after=24h secret-v2/myapp/database
+Task 5: Practical Secret Management Scenarios
+Subtask 5.1: Database Connection Management
+Create a comprehensive database configuration:
+vault kv put secret-v2/databases/production \
+  host=prod-db-cluster.company.com \
+  port=5432 \
+  database=production_app \
+  username=app_prod_user \
+  password=super_secure_prod_password \
+  ssl_mode=require \
+  connection_timeout=30 \
+  max_connections=100
+Create a staging environment configuration:
+vault kv put secret-v2/databases/staging \
+  host=staging-db.company.com \
+  port=5432 \
+  database=staging_app \
+  username=app_staging_user \
+  password=staging_password_123 \
+  ssl_mode=prefer \
+  connection_timeout=15 \
+  max_connections=50
+Retrieve database configurations for different environments:
+vault kv get -field=host secret-v2/databases/production
+vault kv get -field=username secret-v2/databases/staging
+Subtask 5.2: API Key Management
+Store API keys for external services:
+vault kv put secret-v2/external-apis/payment-gateway \
+  api_key=pk_live_abc123def456ghi789 \
+  secret_key=sk_live_xyz987uvw654rst321 \
+  webhook_secret=whsec_webhook123secret456 \
+  environment=production
+
+vault kv put secret-v2/external-apis/email-service \
+  api_key=SG.email_api_key_here.more_key_data \
+  sender_email=noreply@company.com \
+  sender_name="Company Name" \
+  rate_limit=1000
+Update API keys (simulating key rotation):
+vault kv put secret-v2/external-apis/payment-gateway \
+  api_key=pk_live_new123key456here789 \
+  secret_key=sk_live_new987key654here321 \
+  webhook_secret=whsec_newwebhook123secret456 \
+  environment=production \
+  rotated_date="2024-01-15"
+Retrieve the current and previous API keys:
+vault kv get secret-v2/external-apis/payment-gateway
+vault kv get -version=1 secret-v2/external-apis/payment-gateway
+Subtask 5.3: Certificate and SSL Management
+Store SSL certificate information:
+vault kv put secret-v2/certificates/web-server \
+  certificate="-----BEGIN CERTIFICATE-----
+MIIDXTCCAkWgAwIBAgIJAKoK/heBjcOuMA0GCSqGSIb3DQEBBQUAMEUxCzAJBgNV
+[certificate content would go here]
+-----END CERTIFICATE-----" \
+  private_key="-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKB
+[private key content would go here]
+-----END PRIVATE KEY-----" \
+  expiry_date="2025-12-31" \
+  issuer="Let's Encrypt"
+Store certificate metadata separately:
+vault kv put secret-v2/certificates/metadata/web-server \
+  domain=www.company.com \
+  san_domains="company.com,api.company.com" \
+  issued_date="2024-01-01" \
+  expiry_date="2025-12-31" \
+  auto_renew=true
+Task 6: Secret Engine Comparison and Best Practices
+Subtask 6.1: Compare KV Version 1 and Version 2
+Create the same secret in both engines:
+# KV v1
+vault kv put secret-v1/comparison \
+  service=web-app \
+  environment=production \
+  version=1.0
+
+# KV v2
+vault kv put secret-v2/comparison \
+  service=web-app \
+  environment=production \
+  version=1.0
+Update both secrets:
+# KV v1 - overwrites completely
+vault kv put secret-v1/comparison \
+  service=web-app \
+  environment=production \
+  version=2.0
+
+# KV v2 - creates new version
+vault kv put secret-v2/comparison \
+  service=web-app \
+  environment=production \
+  version=2.0
+Try to retrieve old versions:
+# KV v1 - old version is gone
+vault kv get secret-v1/comparison
+
+# KV v2 - can access both versions
+vault kv get -version=1 secret-v2/comparison
+vault kv get -version=2 secret-v2/comparison
+Subtask 6.2: Implement Secret Policies
+Create a policy file for read-only access:
+tee readonly-policy.hcl > /dev/null <<EOF
+path "secret-v2/data/myapp/*" {
+  capabilities = ["read"]
+}
+
+path "secret-v2/metadata/myapp/*" {
+  capabilities = ["read", "list"]
+}
+EOF
+Create the policy in Vault:
+vault policy write readonly-policy readonly-policy.hcl
+Create a policy for full access to specific paths:
+tee app-admin-policy.hcl > /dev/null <<EOF
+path "secret-v2/data/myapp/*" {
+  capabilities = ["create", "read", "update", "delete", "list"]
+}
+
+path "secret-v2/metadata/myapp/*" {
+  capabilities = ["create", "read", "update", "delete", "list"]
+}
+
+path "secret-v2/delete/myapp/*" {
+  capabilities = ["update"]
+}
+
+path "secret-v2/undelete/myapp/*" {
+  capabilities = ["update"]
+}
+
+path "secret-v2/destroy/myapp/*" {
+  capabilities = ["update"]
+}
+EOF
+Create the admin policy:
+vault policy write app-admin-policy app-admin-policy.hcl
+List all policies:
+vault policy list
+Task 7: Cleanup and Verification
+Subtask 7.1: Verify All Operations
+List all secrets in both engines:
+echo "=== KV Version 1 Secrets ==="
+vault kv list secret-v1/
+
+echo "=== KV Version 2 Secrets ==="
+vault kv list secret-v2/
+Check metadata for versioned secrets:
+vault kv metadata get secret-v2/myapp/database
+vault kv metadata get secret-v2/api/keys
+Verify secret engine configurations:
+vault read secret-v2/config
+Subtask 7.2: Document Secret Management Practices
+Create a summary of stored secrets:
+echo "=== Secret Inventory ===" > secret_inventory.txt
+echo "KV Version 1:" >> secret_inventory.txt
+vault kv list -format=json secret-v1/ >> secret_inventory.txt
+echo "" >> secret_inventory.txt
+echo "KV Version 2:" >> secret_inventory.txt
+vault kv list -format=json secret-v2/ >> secret_inventory.txt
+View the inventory:
+cat secret_inventory.txt
+Troubleshooting Tips
+Common Issues and Solutions
+Issue: Vault server won't start
+
+Solution: Check if port 8200 is already in use: netstat -tlnp | grep 8200
+Solution: Verify configuration file syntax: vault server -config=/opt/vault/config/vault.hcl -test
+Issue: Cannot unseal Vault
+
+Solution: Ensure you're using the correct unseal keys from initialization
+Solution: Check that you're providing at least the threshold number of keys (3 in our case)
+Issue: Permission denied when accessing secrets
+
+Solution: Verify your token is set: echo $VAULT_TOKEN
+Solution: Check if your token has the necessary permissions
+Issue: Secret not found
+
+Solution: Verify the correct path format for KV v2: secret-v2/data/path vs secret-v2/path
+Solution: Use vault kv list to see available secrets
+Issue: Version not found in KV v2
+
+Solution: Check available versions: vault kv metadata get path/to/secret
+Solution: Verify the version wasn't destroyed: destroyed versions cannot be recovered
+Conclusion
+In this comprehensive lab, you have successfully:
+
+Installed and configured HashiCorp Vault on a Linux system, learning the fundamental setup process for a production-ready secret management solution
+Initialized and unsealed Vault, understanding the security model that protects secrets even when the storage backend is compromised
+Implemented both KV version 1 and version 2 secrets engines, gaining hands-on experience with different approaches to secret storage
+Stored, retrieved, and managed secrets using various methods and formats, preparing you for real-world secret management scenarios
+Mastered versioned secrets management, including creating, updating, deleting, and restoring different versions of secrets
+Applied practical secret management patterns for databases, APIs, and certificates that mirror production environments
+Understood the differences between KV engines, enabling you to choose the right approach for different use cases
+Why This Matters: Secret management is critical for modern application security. Vault provides enterprise-grade secret storage with features like encryption at rest, detailed audit logs, fine-grained access control, and secret versioning. The skills you've developed in this lab directly apply to:
+
+DevOps and Infrastructure: Securely managing database credentials, API keys, and certificates in automated deployment pipelines
+Application Development: Implementing secure secret retrieval in applications without hardcoding sensitive information
+Security Operations: Establishing secret rotation policies, access controls, and audit trails for compliance requirements
+Cloud Migration: Managing secrets across hybrid and multi-cloud environments with consistent policies
+The versioning capabilities you've learned are particularly valuable for secret rotation strategies, rollback procedures, and maintaining service continuity during credential updates. These practices form the foundation of a robust security posture in modern IT environments.
