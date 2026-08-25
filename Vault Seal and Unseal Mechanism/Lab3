@@ -1,0 +1,595 @@
+Vault Seal and Unseal Mechanism
+Lab Objectives
+By the end of this lab, students will be able to:
+
+Understand HashiCorp Vault's security model and seal/unseal mechanism
+Implement Vault initialization with Shamir's Secret Sharing
+Perform secure unsealing operations using threshold cryptography
+Manage Vault seal states and understand their security implications
+Configure and operate Vault's seal/unseal process in production scenarios
+Troubleshoot common seal/unseal issues and implement best practices
+Prerequisites
+Before starting this lab, students should have:
+
+Basic understanding of Linux command line operations
+Familiarity with cryptographic concepts (encryption, keys, secrets)
+Knowledge of JSON format and basic file operations
+Understanding of security principles and access control
+Basic networking concepts (ports, localhost)
+Lab Environment Setup
+Note: Al Nafi provides Linux-based cloud machines for this lab. Simply click Start Lab to access your dedicated Linux environment. The provided machine is bare metal with no pre-installed tools, so you will install all required components during the lab exercises.
+
+All tasks in this lab will be performed on a single Linux machine. No additional virtual machines or remote hosts are required.
+
+Task 1: Install and Configure HashiCorp Vault
+Subtask 1.1: Install Vault Binary
+First, we need to install HashiCorp Vault on our Linux system.
+
+# Update system packages
+sudo apt update && sudo apt upgrade -y
+
+# Install required dependencies
+sudo apt install -y wget unzip curl gpg
+
+# Download Vault binary (latest stable version)
+cd /tmp
+wget https://releases.hashicorp.com/vault/1.15.2/vault_1.15.2_linux_amd64.zip
+
+# Verify the download
+wget https://releases.hashicorp.com/vault/1.15.2/vault_1.15.2_SHA256SUMS
+wget https://releases.hashicorp.com/vault/1.15.2/vault_1.15.2_SHA256SUMS.sig
+
+# Extract and install Vault
+unzip vault_1.15.2_linux_amd64.zip
+sudo mv vault /usr/local/bin/
+sudo chmod +x /usr/local/bin/vault
+
+# Verify installation
+vault version
+Subtask 1.2: Create Vault Configuration
+Create a configuration file for Vault server operation.
+
+# Create Vault directory structure
+sudo mkdir -p /opt/vault/data
+sudo mkdir -p /etc/vault.d
+
+# Create Vault configuration file
+sudo tee /etc/vault.d/vault.hcl > /dev/null <<EOF
+ui = true
+disable_mlock = true
+
+storage "file" {
+  path = "/opt/vault/data"
+}
+
+listener "tcp" {
+  address     = "127.0.0.1:8200"
+  tls_disable = 1
+}
+
+api_addr = "http://127.0.0.1:8200"
+cluster_addr = "https://127.0.0.1:8201"
+EOF
+
+# Set appropriate permissions
+sudo chown -R vault:vault /opt/vault /etc/vault.d 2>/dev/null || true
+sudo chmod 640 /etc/vault.d/vault.hcl
+Subtask 1.3: Create Vault Service User
+# Create vault user for service
+sudo useradd --system --home /etc/vault.d --shell /bin/false vault
+
+# Set ownership
+sudo chown -R vault:vault /opt/vault /etc/vault.d
+Subtask 1.4: Start Vault Server
+# Start Vault server in development mode for learning
+# Note: In production, you would use a systemd service
+vault server -config=/etc/vault.d/vault.hcl &
+
+# Wait for server to start
+sleep 5
+
+# Verify server is running
+curl -s http://127.0.0.1:8200/v1/sys/health | head -20
+Task 2: Initialize Vault with Shamir's Secret Sharing
+Subtask 2.1: Understanding Shamir's Secret Sharing
+Shamir's Secret Sharing is a cryptographic algorithm that divides a secret into multiple parts (shares), where a minimum threshold of shares is required to reconstruct the original secret. Vault uses this for the unseal keys.
+
+Key concepts:
+
+Shares: Total number of key shares generated
+Threshold: Minimum number of shares needed to unseal
+Master Key: The key that encrypts Vault's encryption key
+Subtask 2.2: Initialize Vault
+# Set Vault address environment variable
+export VAULT_ADDR='http://127.0.0.1:8200'
+
+# Initialize Vault with 5 key shares and threshold of 3
+vault operator init -key-shares=5 -key-threshold=3 -format=json > /tmp/vault-init.json
+
+# Display initialization results
+echo "Vault Initialization Complete!"
+echo "================================"
+cat /tmp/vault-init.json | jq '.'
+Subtask 2.3: Extract and Store Unseal Keys
+# Extract unseal keys and root token
+jq -r '.unseal_keys_b64[]' /tmp/vault-init.json > /tmp/unseal-keys.txt
+jq -r '.root_token' /tmp/vault-init.json > /tmp/root-token.txt
+
+# Display the keys (for learning purposes only)
+echo "Unseal Keys:"
+echo "============"
+cat /tmp/unseal-keys.txt | nl
+
+echo ""
+echo "Root Token:"
+echo "==========="
+cat /tmp/root-token.txt
+
+# Check Vault status (should show sealed=true)
+vault status
+Task 3: Implement Vault Unsealing Process
+Subtask 3.1: Understanding Vault Seal States
+Vault has two primary states:
+
+Sealed: Vault cannot decrypt data, all operations are blocked
+Unsealed: Vault can decrypt data and serve requests
+# Check current seal status
+echo "Current Vault Status:"
+echo "===================="
+vault status
+
+# Note the sealed=true status
+Subtask 3.2: Perform Manual Unsealing
+# Read unseal keys into variables
+KEY1=$(sed -n '1p' /tmp/unseal-keys.txt)
+KEY2=$(sed -n '2p' /tmp/unseal-keys.txt)
+KEY3=$(sed -n '3p' /tmp/unseal-keys.txt)
+
+echo "Starting unseal process..."
+echo "========================="
+
+# First unseal key
+echo "Providing first unseal key..."
+vault operator unseal $KEY1
+
+echo ""
+echo "Status after first key:"
+vault status | grep -E "(Sealed|Unseal Progress)"
+
+# Second unseal key
+echo ""
+echo "Providing second unseal key..."
+vault operator unseal $KEY2
+
+echo ""
+echo "Status after second key:"
+vault status | grep -E "(Sealed|Unseal Progress)"
+
+# Third unseal key (should complete unsealing)
+echo ""
+echo "Providing third unseal key..."
+vault operator unseal $KEY3
+
+echo ""
+echo "Final status:"
+vault status
+Subtask 3.3: Verify Unsealed State
+# Authenticate with root token
+export VAULT_TOKEN=$(cat /tmp/root-token.txt)
+
+# Test Vault functionality
+echo "Testing Vault functionality:"
+echo "============================"
+
+# Enable key-value secrets engine
+vault secrets enable -path=secret kv-v2
+
+# Write a test secret
+vault kv put secret/test-data username="testuser" password="testpass123"
+
+# Read the test secret
+vault kv get secret/test-data
+
+echo ""
+echo "Vault is successfully unsealed and operational!"
+Task 4: Implement Automated Unsealing Script
+Subtask 4.1: Create Unseal Script
+# Create automated unseal script
+cat > /tmp/vault-unseal.sh << 'EOF'
+#!/bin/bash
+
+# Vault Automated Unseal Script
+# This script demonstrates automated unsealing for learning purposes
+# In production, use auto-unseal with cloud KMS
+
+VAULT_ADDR="http://127.0.0.1:8200"
+UNSEAL_KEYS_FILE="/tmp/unseal-keys.txt"
+
+echo "Vault Automated Unseal Script"
+echo "============================="
+
+# Check if Vault is running
+if ! curl -s $VAULT_ADDR/v1/sys/health > /dev/null; then
+    echo "Error: Vault server is not running or not accessible"
+    exit 1
+fi
+
+# Check if unseal keys file exists
+if [ ! -f "$UNSEAL_KEYS_FILE" ]; then
+    echo "Error: Unseal keys file not found at $UNSEAL_KEYS_FILE"
+    exit 1
+fi
+
+# Check current seal status
+SEALED=$(vault status -format=json | jq -r '.sealed')
+
+if [ "$SEALED" = "false" ]; then
+    echo "Vault is already unsealed"
+    exit 0
+fi
+
+echo "Vault is sealed. Beginning unseal process..."
+
+# Read first 3 keys (threshold)
+KEYS=($(head -3 $UNSEAL_KEYS_FILE))
+
+# Unseal with each key
+for i in "${!KEYS[@]}"; do
+    echo "Applying unseal key $((i+1))/3..."
+    vault operator unseal "${KEYS[$i]}" > /dev/null
+    
+    # Check progress
+    PROGRESS=$(vault status -format=json | jq -r '.unseal_progress')
+    THRESHOLD=$(vault status -format=json | jq -r '.unseal_threshold')
+    echo "Progress: $PROGRESS/$THRESHOLD"
+done
+
+# Verify final status
+SEALED=$(vault status -format=json | jq -r '.sealed')
+if [ "$SEALED" = "false" ]; then
+    echo "Success: Vault has been unsealed!"
+else
+    echo "Error: Vault unsealing failed"
+    exit 1
+fi
+EOF
+
+# Make script executable
+chmod +x /tmp/vault-unseal.sh
+Subtask 4.2: Test Seal and Unseal Cycle
+# First, seal the Vault
+echo "Sealing Vault..."
+vault operator seal
+
+# Verify sealed state
+echo "Vault status after sealing:"
+vault status | grep -E "(Sealed|Version)"
+
+# Test our automated unseal script
+echo ""
+echo "Testing automated unseal script:"
+/tmp/vault-unseal.sh
+
+# Verify unsealed state
+echo ""
+echo "Final verification:"
+vault status | grep -E "(Sealed|Version)"
+Task 5: Advanced Seal/Unseal Operations
+Subtask 5.1: Implement Seal Status Monitoring
+# Create seal status monitoring script
+cat > /tmp/vault-monitor.sh << 'EOF'
+#!/bin/bash
+
+# Vault Seal Status Monitor
+VAULT_ADDR="http://127.0.0.1:8200"
+
+echo "Vault Seal Status Monitor"
+echo "========================"
+
+while true; do
+    if curl -s $VAULT_ADDR/v1/sys/health > /dev/null; then
+        STATUS=$(vault status -format=json 2>/dev/null)
+        
+        if [ $? -eq 0 ]; then
+            SEALED=$(echo $STATUS | jq -r '.sealed')
+            VERSION=$(echo $STATUS | jq -r '.version')
+            CLUSTER_NAME=$(echo $STATUS | jq -r '.cluster_name // "default"')
+            
+            TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+            
+            if [ "$SEALED" = "true" ]; then
+                PROGRESS=$(echo $STATUS | jq -r '.unseal_progress')
+                THRESHOLD=$(echo $STATUS | jq -r '.unseal_threshold')
+                echo "[$TIMESTAMP] SEALED - Progress: $PROGRESS/$THRESHOLD"
+            else
+                echo "[$TIMESTAMP] UNSEALED - Version: $VERSION, Cluster: $CLUSTER_NAME"
+            fi
+        else
+            echo "[$TIMESTAMP] ERROR - Cannot get Vault status"
+        fi
+    else
+        echo "[$TIMESTAMP] ERROR - Vault server unreachable"
+    fi
+    
+    sleep 10
+done
+EOF
+
+chmod +x /tmp/vault-monitor.sh
+
+# Run monitor for 30 seconds to demonstrate
+echo "Running seal status monitor (will stop automatically after 30 seconds)..."
+timeout 30 /tmp/vault-monitor.sh
+Subtask 5.2: Key Rotation Demonstration
+# Demonstrate key rotation (rekey operation)
+echo "Demonstrating Vault Key Rotation"
+echo "================================"
+
+# Initialize rekey operation
+vault operator rekey -init -key-shares=3 -key-threshold=2
+
+# Check rekey status
+vault operator rekey -status
+
+# Note: In a real scenario, you would provide the required number of 
+# current unseal keys to complete the rekey operation
+echo "Rekey operation initialized. In production, operators would"
+echo "provide the required threshold of current unseal keys to complete rotation."
+
+# Cancel the rekey for this demonstration
+vault operator rekey -cancel
+echo "Rekey operation cancelled for demonstration purposes."
+Subtask 5.3: Recovery Key Operations
+# Demonstrate recovery key concepts
+echo "Recovery Key Operations"
+echo "======================"
+
+# Show current auth methods
+vault auth list
+
+# Enable userpass auth method for demonstration
+vault auth enable userpass
+
+# Create a user
+vault write auth/userpass/users/operator password=secure123 policies=default
+
+# Test authentication
+vault auth -method=userpass username=operator password=secure123
+
+# Show token info
+vault token lookup
+
+# Return to root token
+export VAULT_TOKEN=$(cat /tmp/root-token.txt)
+Task 6: Security Best Practices and Troubleshooting
+Subtask 6.1: Implement Security Best Practices
+# Create security checklist script
+cat > /tmp/vault-security-check.sh << 'EOF'
+#!/bin/bash
+
+echo "Vault Security Configuration Checklist"
+echo "======================================"
+
+# Check 1: TLS Configuration
+echo "1. TLS Configuration:"
+if grep -q "tls_disable.*1" /etc/vault.d/vault.hcl; then
+    echo "   WARNING: TLS is disabled (acceptable for learning/development only)"
+else
+    echo "   OK: TLS is enabled"
+fi
+
+# Check 2: Storage Backend
+echo "2. Storage Backend:"
+STORAGE=$(grep -A2 "storage" /etc/vault.d/vault.hcl | grep -o '"[^"]*"' | head -1)
+echo "   Using storage: $STORAGE"
+if [[ $STORAGE == *"file"* ]]; then
+    echo "   NOTE: File storage is for development only"
+fi
+
+# Check 3: Seal Keys Security
+echo "3. Unseal Keys Security:"
+if [ -f "/tmp/unseal-keys.txt" ]; then
+    echo "   WARNING: Unseal keys stored in plaintext (learning environment only)"
+    echo "   PRODUCTION: Store keys securely, distribute to key holders"
+fi
+
+# Check 4: Root Token
+echo "4. Root Token Security:"
+if [ -f "/tmp/root-token.txt" ]; then
+    echo "   WARNING: Root token stored in plaintext (learning environment only)"
+    echo "   PRODUCTION: Revoke root token after initial setup"
+fi
+
+# Check 5: Vault Process
+echo "5. Vault Process Security:"
+VAULT_PROC=$(ps aux | grep vault | grep -v grep)
+if [[ $VAULT_PROC == *"vault"* ]]; then
+    echo "   OK: Vault process is running"
+else
+    echo "   ERROR: Vault process not found"
+fi
+
+echo ""
+echo "Security Recommendations for Production:"
+echo "- Enable TLS with proper certificates"
+echo "- Use cloud KMS for auto-unsealing"
+echo "- Implement proper key management procedures"
+echo "- Use appropriate storage backend (Consul, etc.)"
+echo "- Enable audit logging"
+echo "- Implement proper access policies"
+EOF
+
+chmod +x /tmp/vault-security-check.sh
+/tmp/vault-security-check.sh
+Subtask 6.2: Common Troubleshooting Scenarios
+# Create troubleshooting guide
+cat > /tmp/vault-troubleshooting.sh << 'EOF'
+#!/bin/bash
+
+echo "Vault Troubleshooting Guide"
+echo "=========================="
+
+# Function to check Vault connectivity
+check_connectivity() {
+    echo "Checking Vault connectivity..."
+    if curl -s http://127.0.0.1:8200/v1/sys/health > /dev/null; then
+        echo "✓ Vault server is reachable"
+        return 0
+    else
+        echo "✗ Vault server is not reachable"
+        return 1
+    fi
+}
+
+# Function to check seal status
+check_seal_status() {
+    echo "Checking seal status..."
+    STATUS=$(vault status -format=json 2>/dev/null)
+    if [ $? -eq 0 ]; then
+        SEALED=$(echo $STATUS | jq -r '.sealed')
+        if [ "$SEALED" = "true" ]; then
+            echo "✗ Vault is sealed"
+            PROGRESS=$(echo $STATUS | jq -r '.unseal_progress')
+            THRESHOLD=$(echo $STATUS | jq -r '.unseal_threshold')
+            echo "  Unseal progress: $PROGRESS/$THRESHOLD"
+        else
+            echo "✓ Vault is unsealed"
+        fi
+    else
+        echo "✗ Cannot determine seal status"
+    fi
+}
+
+# Function to check authentication
+check_auth() {
+    echo "Checking authentication..."
+    if [ -z "$VAULT_TOKEN" ]; then
+        echo "✗ VAULT_TOKEN not set"
+    else
+        if vault token lookup > /dev/null 2>&1; then
+            echo "✓ Authentication successful"
+        else
+            echo "✗ Authentication failed"
+        fi
+    fi
+}
+
+# Run all checks
+check_connectivity
+check_seal_status
+check_auth
+
+echo ""
+echo "Common Issues and Solutions:"
+echo "1. 'connection refused' - Check if Vault server is running"
+echo "2. 'Vault is sealed' - Run unseal process with threshold keys"
+echo "3. 'permission denied' - Check VAULT_TOKEN is set and valid"
+echo "4. 'bad certificate' - Verify TLS configuration"
+EOF
+
+chmod +x /tmp/vault-troubleshooting.sh
+/tmp/vault-troubleshooting.sh
+Task 7: Cleanup and Documentation
+Subtask 7.1: Create Operation Documentation
+# Create comprehensive documentation
+cat > /tmp/vault-operations-guide.md << 'EOF'
+# Vault Operations Guide
+
+## Seal/Unseal Operations
+
+### Manual Unsealing
+```bash
+# Check status
+vault status
+
+# Unseal with keys (repeat until threshold met)
+vault operator unseal <key1>
+vault operator unseal <key2>
+vault operator unseal <key3>
+Sealing Vault
+# Seal Vault (requires authentication)
+vault operator seal
+Key Management
+# Initialize new Vault
+vault operator init -key-shares=5 -key-threshold=3
+
+# Rotate keys
+vault operator rekey -init -key-shares=3 -key-threshold=2
+Monitoring
+# Check health
+curl http://127.0.0.1:8200/v1/sys/health
+
+# Get detailed status
+vault status -format=json
+Security Considerations
+Key Distribution: Distribute unseal keys to different trusted operators
+Key Storage: Never store keys in plaintext in production
+Auto-Unseal: Use cloud KMS for automatic unsealing in production
+Audit Logging: Enable comprehensive audit logging
+Network Security: Use TLS and restrict network access
+Emergency Procedures
+Lost Keys: Use recovery keys if configured
+Compromised Keys: Immediately rotate keys using rekey operation
+Server Failure: Restore from backup and unseal with keys EOF
+echo "Operations guide created at /tmp/vault-operations-guide.md"
+
+
+### Subtask 7.2: Clean Up Lab Environment
+
+```bash
+# Create cleanup script
+cat > /tmp/cleanup-vault-lab.sh << 'EOF'
+#!/bin/bash
+
+echo "Cleaning up Vault Lab Environment"
+echo "================================="
+
+# Stop Vault server
+echo "Stopping Vault server..."
+pkill vault
+
+# Remove temporary files
+echo "Removing temporary files..."
+rm -f /tmp/vault-init.json
+rm -f /tmp/unseal-keys.txt
+rm -f /tmp/root-token.txt
+rm -f /tmp/vault-*.sh
+
+# Optional: Remove Vault data (uncomment if desired)
+# sudo rm -rf /opt/vault/data/*
+
+echo "Cleanup completed!"
+echo ""
+echo "To completely remove Vault:"
+echo "sudo rm -rf /opt/vault /etc/vault.d"
+echo "sudo userdel vault"
+echo "sudo rm /usr/local/bin/vault"
+EOF
+
+chmod +x /tmp/cleanup-vault-lab.sh
+
+echo "Cleanup script created. Run /tmp/cleanup-vault-lab.sh when ready to clean up."
+Conclusion
+In this comprehensive lab, you have successfully:
+
+Installed and configured HashiCorp Vault on a Linux system with proper security configurations
+Implemented Vault initialization using Shamir's Secret Sharing with configurable key shares and threshold
+Mastered the seal/unseal process including manual and automated unsealing procedures
+Created monitoring and troubleshooting tools for operational management
+Applied security best practices and understood production considerations
+Developed operational procedures for key management and emergency scenarios
+Key Takeaways
+Shamir's Secret Sharing provides robust security by requiring multiple key holders to unseal Vault
+Seal/unseal operations are critical for Vault security and must be properly managed
+Automation scripts can help with operational tasks but must be secured appropriately
+Security best practices are essential for production deployments
+Monitoring and troubleshooting capabilities are crucial for reliable operations
+Real-World Applications
+This knowledge is directly applicable to:
+
+Enterprise secret management systems
+DevOps and CI/CD pipeline security
+Cloud infrastructure security
+Compliance and audit requirements
+Disaster recovery procedures
+The seal/unseal mechanism is fundamental to Vault's security model and understanding it thoroughly enables you to implement robust secret management solutions in production environments.
