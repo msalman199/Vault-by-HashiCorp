@@ -1,0 +1,562 @@
+Vault for Multi-cloud Environments
+Lab Objectives
+By the end of this lab, you will be able to:
+
+Install and configure HashiCorp Vault on a Linux machine
+Set up Vault authentication methods for AWS, Azure, and GCP
+Create and manage secrets across multiple cloud environments
+Configure secure secret access policies for multi-cloud scenarios
+Implement cross-cloud secret sharing and access controls
+Understand Vault's role in multi-cloud security architecture
+Prerequisites
+Before starting this lab, you should have:
+
+Basic understanding of cloud computing concepts
+Familiarity with Linux command line operations
+Knowledge of JSON and YAML file formats
+Understanding of basic security concepts like authentication and authorization
+Experience with at least one cloud provider (AWS, Azure, or GCP)
+Lab Environment
+Al Nafi provides Linux-based cloud machines for this lab. Simply click Start Lab to access your dedicated Linux machine. The provided machine is bare metal with no pre-installed tools, so you will install all required software during the lab exercises.
+
+Task 1: Set up Vault to Manage Secrets Across AWS, Azure, and GCP
+Subtask 1.1: Install HashiCorp Vault
+First, we'll install Vault on our Linux machine and set up the basic configuration.
+
+Step 1: Update the system and install required packages
+
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y wget unzip curl jq
+Step 2: Download and install Vault
+
+# Download the latest Vault binary
+wget https://releases.hashicorp.com/vault/1.15.2/vault_1.15.2_linux_amd64.zip
+
+# Unzip the binary
+unzip vault_1.15.2_linux_amd64.zip
+
+# Move to system path
+sudo mv vault /usr/local/bin/
+
+# Verify installation
+vault version
+Step 3: Create Vault configuration directory and files
+
+# Create Vault directories
+sudo mkdir -p /etc/vault.d
+sudo mkdir -p /opt/vault/data
+
+# Create Vault configuration file
+sudo tee /etc/vault.d/vault.hcl > /dev/null <<EOF
+ui = true
+disable_mlock = true
+
+storage "file" {
+  path = "/opt/vault/data"
+}
+
+listener "tcp" {
+  address     = "0.0.0.0:8200"
+  tls_disable = 1
+}
+
+api_addr = "http://127.0.0.1:8200"
+cluster_addr = "https://127.0.0.1:8201"
+EOF
+Subtask 1.2: Initialize and Configure Vault
+Step 1: Start Vault server
+
+# Start Vault in development mode for this lab
+vault server -config=/etc/vault.d/vault.hcl &
+
+# Wait for Vault to start
+sleep 5
+
+# Set environment variable
+export VAULT_ADDR='http://127.0.0.1:8200'
+Step 2: Initialize Vault
+
+# Initialize Vault
+vault operator init -key-shares=1 -key-threshold=1 > vault-init.txt
+
+# Extract unseal key and root token
+UNSEAL_KEY=$(grep 'Unseal Key 1:' vault-init.txt | awk '{print $NF}')
+ROOT_TOKEN=$(grep 'Initial Root Token:' vault-init.txt | awk '{print $NF}')
+
+# Unseal Vault
+vault operator unseal $UNSEAL_KEY
+
+# Login with root token
+vault auth $ROOT_TOKEN
+Subtask 1.3: Enable Secret Engines for Multi-cloud
+Step 1: Enable AWS secrets engine
+
+# Enable AWS secrets engine
+vault secrets enable -path=aws aws
+
+# Configure AWS secrets engine (using mock credentials for lab)
+vault write aws/config/root \
+    access_key=AKIAIOSFODNN7EXAMPLE \
+    secret_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY \
+    region=us-east-1
+Step 2: Enable Azure secrets engine
+
+# Enable Azure secrets engine
+vault secrets enable -path=azure azure
+
+# Configure Azure secrets engine (using mock credentials for lab)
+vault write azure/config \
+    subscription_id=12345678-1234-1234-1234-123456789012 \
+    tenant_id=87654321-4321-4321-4321-210987654321 \
+    client_id=abcdefgh-ijkl-mnop-qrst-uvwxyz123456 \
+    client_secret=your-client-secret-here
+Step 3: Enable GCP secrets engine
+
+# Enable GCP secrets engine
+vault secrets enable -path=gcp gcp
+
+# Create a mock GCP service account key file
+cat > gcp-key.json <<EOF
+{
+  "type": "service_account",
+  "project_id": "my-project-123456",
+  "private_key_id": "key-id",
+  "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC...\n-----END PRIVATE KEY-----\n",
+  "client_email": "vault-service@my-project-123456.iam.gserviceaccount.com",
+  "client_id": "123456789012345678901",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token"
+}
+EOF
+
+# Configure GCP secrets engine
+vault write gcp/config credentials=@gcp-key.json
+Subtask 1.4: Create Multi-cloud Secret Roles
+Step 1: Create AWS IAM role
+
+# Create AWS role for EC2 instances
+vault write aws/roles/ec2-role \
+    credential_type=iam_user \
+    policy_document=-<<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeInstances",
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+EOF
+Step 2: Create Azure role
+
+# Create Azure role for virtual machines
+vault write azure/roles/vm-role \
+    azure_roles=-<<EOF
+[
+  {
+    "role_name": "Contributor",
+    "scope": "/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/my-resource-group"
+  }
+]
+EOF
+Step 3: Create GCP role
+
+# Create GCP role for compute instances
+vault write gcp/roleset/compute-role \
+    project="my-project-123456" \
+    bindings=-<<EOF
+resource "//cloudresourcemanager.googleapis.com/projects/my-project-123456" {
+  roles = [
+    "roles/compute.instanceAdmin.v1",
+    "roles/storage.objectViewer"
+  ]
+}
+EOF
+Task 2: Secure Secret Access Between Clouds
+Subtask 2.1: Configure Authentication Methods
+Step 1: Enable and configure AppRole authentication
+
+# Enable AppRole authentication method
+vault auth enable approle
+
+# Create policy for multi-cloud access
+vault policy write multi-cloud-policy - <<EOF
+# Allow reading secrets from all cloud providers
+path "aws/creds/ec2-role" {
+  capabilities = ["read"]
+}
+
+path "azure/creds/vm-role" {
+  capabilities = ["read"]
+}
+
+path "gcp/roleset/compute-role/key" {
+  capabilities = ["read"]
+}
+
+# Allow reading from KV store
+path "secret/data/multi-cloud/*" {
+  capabilities = ["read", "list"]
+}
+EOF
+
+# Create AppRole for multi-cloud access
+vault write auth/approle/role/multi-cloud-app \
+    token_policies="multi-cloud-policy" \
+    token_ttl=1h \
+    token_max_ttl=4h
+Step 2: Get AppRole credentials
+
+# Get Role ID
+ROLE_ID=$(vault read -field=role_id auth/approle/role/multi-cloud-app/role-id)
+
+# Generate Secret ID
+SECRET_ID=$(vault write -field=secret_id -f auth/approle/role/multi-cloud-app/secret-id)
+
+echo "Role ID: $ROLE_ID"
+echo "Secret ID: $SECRET_ID"
+Subtask 2.2: Create Cross-cloud Secret Store
+Step 1: Enable KV secrets engine
+
+# Enable KV v2 secrets engine
+vault secrets enable -path=secret kv-v2
+
+# Create multi-cloud configuration secrets
+vault kv put secret/multi-cloud/aws \
+    region="us-east-1" \
+    vpc_id="vpc-12345678" \
+    subnet_id="subnet-87654321"
+
+vault kv put secret/multi-cloud/azure \
+    location="East US" \
+    resource_group="my-rg" \
+    vnet_name="my-vnet"
+
+vault kv put secret/multi-cloud/gcp \
+    project_id="my-project-123456" \
+    zone="us-central1-a" \
+    network="default"
+Step 2: Create database connection secrets
+
+# Create database secrets for each cloud
+vault kv put secret/multi-cloud/databases/aws-rds \
+    host="mydb.cluster-xyz.us-east-1.rds.amazonaws.com" \
+    username="dbadmin" \
+    password="secure-password-123" \
+    database="production"
+
+vault kv put secret/multi-cloud/databases/azure-sql \
+    host="myserver.database.windows.net" \
+    username="sqladmin" \
+    password="secure-password-456" \
+    database="production"
+
+vault kv put secret/multi-cloud/databases/gcp-sql \
+    host="10.1.2.3" \
+    username="postgres" \
+    password="secure-password-789" \
+    database="production"
+Subtask 2.3: Implement Secret Access Controls
+Step 1: Create environment-specific policies
+
+# Create AWS-specific policy
+vault policy write aws-only-policy - <<EOF
+path "aws/creds/ec2-role" {
+  capabilities = ["read"]
+}
+
+path "secret/data/multi-cloud/aws" {
+  capabilities = ["read"]
+}
+
+path "secret/data/multi-cloud/databases/aws-rds" {
+  capabilities = ["read"]
+}
+EOF
+
+# Create Azure-specific policy
+vault policy write azure-only-policy - <<EOF
+path "azure/creds/vm-role" {
+  capabilities = ["read"]
+}
+
+path "secret/data/multi-cloud/azure" {
+  capabilities = ["read"]
+}
+
+path "secret/data/multi-cloud/databases/azure-sql" {
+  capabilities = ["read"]
+}
+EOF
+
+# Create GCP-specific policy
+vault policy write gcp-only-policy - <<EOF
+path "gcp/roleset/compute-role/key" {
+  capabilities = ["read"]
+}
+
+path "secret/data/multi-cloud/gcp" {
+  capabilities = ["read"]
+}
+
+path "secret/data/multi-cloud/databases/gcp-sql" {
+  capabilities = ["read"]
+}
+EOF
+Step 2: Create cloud-specific AppRoles
+
+# Create AWS-specific AppRole
+vault write auth/approle/role/aws-app \
+    token_policies="aws-only-policy" \
+    token_ttl=30m \
+    token_max_ttl=1h
+
+# Create Azure-specific AppRole
+vault write auth/approle/role/azure-app \
+    token_policies="azure-only-policy" \
+    token_ttl=30m \
+    token_max_ttl=1h
+
+# Create GCP-specific AppRole
+vault write auth/approle/role/gcp-app \
+    token_policies="gcp-only-policy" \
+    token_ttl=30m \
+    token_max_ttl=1h
+Subtask 2.4: Test Multi-cloud Secret Access
+Step 1: Test AWS secret access
+
+# Get AWS AppRole credentials
+AWS_ROLE_ID=$(vault read -field=role_id auth/approle/role/aws-app/role-id)
+AWS_SECRET_ID=$(vault write -field=secret_id -f auth/approle/role/aws-app/secret-id)
+
+# Login with AWS AppRole
+AWS_TOKEN=$(vault write -field=token auth/approle/login \
+    role_id=$AWS_ROLE_ID \
+    secret_id=$AWS_SECRET_ID)
+
+# Test AWS secret access
+VAULT_TOKEN=$AWS_TOKEN vault kv get secret/multi-cloud/aws
+VAULT_TOKEN=$AWS_TOKEN vault read aws/creds/ec2-role
+Step 2: Test Azure secret access
+
+# Get Azure AppRole credentials
+AZURE_ROLE_ID=$(vault read -field=role_id auth/approle/role/azure-app/role-id)
+AZURE_SECRET_ID=$(vault write -field=secret_id -f auth/approle/role/azure-app/secret-id)
+
+# Login with Azure AppRole
+AZURE_TOKEN=$(vault write -field=token auth/approle/login \
+    role_id=$AZURE_ROLE_ID \
+    secret_id=$AZURE_SECRET_ID)
+
+# Test Azure secret access
+VAULT_TOKEN=$AZURE_TOKEN vault kv get secret/multi-cloud/azure
+VAULT_TOKEN=$AZURE_TOKEN vault read azure/creds/vm-role
+Step 3: Test GCP secret access
+
+# Get GCP AppRole credentials
+GCP_ROLE_ID=$(vault read -field=role_id auth/approle/role/gcp-app/role-id)
+GCP_SECRET_ID=$(vault write -field=secret_id -f auth/approle/role/gcp-app/secret-id)
+
+# Login with GCP AppRole
+GCP_TOKEN=$(vault write -field=token auth/approle/login \
+    role_id=$GCP_ROLE_ID \
+    secret_id=$GCP_SECRET_ID)
+
+# Test GCP secret access
+VAULT_TOKEN=$GCP_TOKEN vault kv get secret/multi-cloud/gcp
+VAULT_TOKEN=$GCP_TOKEN vault read gcp/roleset/compute-role/key
+Subtask 2.5: Create Multi-cloud Secret Rotation
+Step 1: Create secret rotation script
+
+# Create rotation script
+cat > rotate-secrets.sh <<'EOF'
+#!/bin/bash
+
+VAULT_ADDR="http://127.0.0.1:8200"
+VAULT_TOKEN="$1"
+
+if [ -z "$VAULT_TOKEN" ]; then
+    echo "Usage: $0 <vault-token>"
+    exit 1
+fi
+
+export VAULT_ADDR VAULT_TOKEN
+
+echo "Rotating multi-cloud secrets..."
+
+# Generate new database passwords
+NEW_AWS_PASSWORD=$(openssl rand -base64 32)
+NEW_AZURE_PASSWORD=$(openssl rand -base64 32)
+NEW_GCP_PASSWORD=$(openssl rand -base64 32)
+
+# Update AWS RDS secret
+vault kv put secret/multi-cloud/databases/aws-rds \
+    host="mydb.cluster-xyz.us-east-1.rds.amazonaws.com" \
+    username="dbadmin" \
+    password="$NEW_AWS_PASSWORD" \
+    database="production"
+
+# Update Azure SQL secret
+vault kv put secret/multi-cloud/databases/azure-sql \
+    host="myserver.database.windows.net" \
+    username="sqladmin" \
+    password="$NEW_AZURE_PASSWORD" \
+    database="production"
+
+# Update GCP SQL secret
+vault kv put secret/multi-cloud/databases/gcp-sql \
+    host="10.1.2.3" \
+    username="postgres" \
+    password="$NEW_GCP_PASSWORD" \
+    database="production"
+
+echo "Secret rotation completed successfully!"
+echo "New passwords have been generated and stored in Vault."
+EOF
+
+chmod +x rotate-secrets.sh
+Step 2: Test secret rotation
+
+# Run secret rotation with root token
+./rotate-secrets.sh $ROOT_TOKEN
+
+# Verify updated secrets
+vault kv get secret/multi-cloud/databases/aws-rds
+vault kv get secret/multi-cloud/databases/azure-sql
+vault kv get secret/multi-cloud/databases/gcp-sql
+Subtask 2.6: Monitor and Audit Multi-cloud Access
+Step 1: Enable audit logging
+
+# Enable file audit device
+vault audit enable file file_path=/opt/vault/audit.log
+
+# Generate some audit events
+vault kv get secret/multi-cloud/aws
+vault read aws/creds/ec2-role
+vault kv get secret/multi-cloud/azure
+Step 2: Create monitoring script
+
+# Create monitoring script
+cat > monitor-vault.sh <<'EOF'
+#!/bin/bash
+
+VAULT_ADDR="http://127.0.0.1:8200"
+VAULT_TOKEN="$1"
+
+if [ -z "$VAULT_TOKEN" ]; then
+    echo "Usage: $0 <vault-token>"
+    exit 1
+fi
+
+export VAULT_ADDR VAULT_TOKEN
+
+echo "=== Vault Multi-cloud Status ==="
+echo
+
+echo "Vault Status:"
+vault status
+echo
+
+echo "Enabled Auth Methods:"
+vault auth list
+echo
+
+echo "Enabled Secret Engines:"
+vault secrets list
+echo
+
+echo "Active Policies:"
+vault policy list
+echo
+
+echo "Recent Audit Log Entries:"
+tail -5 /opt/vault/audit.log | jq -r '.time + " " + .request.path + " " + .auth.display_name'
+EOF
+
+chmod +x monitor-vault.sh
+Step 3: Run monitoring
+
+# Monitor Vault status
+./monitor-vault.sh $ROOT_TOKEN
+Verification and Testing
+Test 1: Verify Multi-cloud Secret Access
+# Test cross-cloud secret retrieval
+echo "Testing multi-cloud secret access..."
+
+# Use multi-cloud token to access all clouds
+MULTI_CLOUD_TOKEN=$(vault write -field=token auth/approle/login \
+    role_id=$ROLE_ID \
+    secret_id=$SECRET_ID)
+
+# Test access to all cloud secrets
+VAULT_TOKEN=$MULTI_CLOUD_TOKEN vault kv get secret/multi-cloud/aws
+VAULT_TOKEN=$MULTI_CLOUD_TOKEN vault kv get secret/multi-cloud/azure
+VAULT_TOKEN=$MULTI_CLOUD_TOKEN vault kv get secret/multi-cloud/gcp
+
+echo "Multi-cloud access test completed!"
+Test 2: Verify Access Controls
+# Test that AWS token cannot access Azure secrets
+echo "Testing access control isolation..."
+
+# Try to access Azure secrets with AWS token (should fail)
+VAULT_TOKEN=$AWS_TOKEN vault kv get secret/multi-cloud/azure 2>&1 | grep -q "permission denied" && echo "Access control working: AWS token cannot access Azure secrets" || echo "Access control failed!"
+
+# Try to access GCP secrets with Azure token (should fail)
+VAULT_TOKEN=$AZURE_TOKEN vault kv get secret/multi-cloud/gcp 2>&1 | grep -q "permission denied" && echo "Access control working: Azure token cannot access GCP secrets" || echo "Access control failed!"
+
+echo "Access control test completed!"
+Troubleshooting Tips
+Common Issues and Solutions
+Issue 1: Vault server not starting
+
+Solution: Check if port 8200 is already in use: netstat -tlnp | grep 8200
+Kill any existing processes and restart Vault
+Issue 2: Authentication failures
+
+Solution: Verify token is not expired: vault token lookup
+Renew token if needed: vault token renew
+Issue 3: Permission denied errors
+
+Solution: Check policy assignments: vault token lookup -format=json | jq .data.policies
+Verify policy contents: vault policy read <policy-name>
+Issue 4: Secret engine not responding
+
+Solution: Check if secret engine is enabled: vault secrets list
+Re-enable if necessary: vault secrets enable -path=<path> <engine-type>
+Cleanup
+# Stop Vault server
+pkill vault
+
+# Remove Vault data (optional)
+sudo rm -rf /opt/vault/data/*
+sudo rm -f /opt/vault/audit.log
+
+# Remove temporary files
+rm -f vault-init.txt gcp-key.json rotate-secrets.sh monitor-vault.sh
+Conclusion
+In this lab, you successfully implemented HashiCorp Vault for managing secrets across multi-cloud environments. You accomplished the following key objectives:
+
+Technical Achievements:
+
+Installed and configured Vault with multi-cloud secret engines for AWS, Azure, and GCP
+Created secure authentication mechanisms using AppRole method
+Implemented granular access controls with environment-specific policies
+Set up cross-cloud secret sharing with proper isolation
+Created automated secret rotation capabilities
+Established audit logging and monitoring for security compliance
+Multi-cloud Security Benefits:
+
+Centralized Secret Management: All cloud credentials and secrets are managed from a single, secure location
+Access Control: Fine-grained policies ensure applications only access secrets they need
+Secret Rotation: Automated rotation reduces the risk of credential compromise
+Audit Trail: Complete logging of all secret access for compliance and security monitoring
+Cross-cloud Compatibility: Seamless secret sharing between different cloud environments
+Real-world Applications: This setup is essential for organizations operating in multi-cloud environments where applications need secure access to resources across AWS, Azure, and GCP. Vault provides the security layer that enables safe multi-cloud operations while maintaining compliance with security best practices.
+
+The skills you've learned in this lab are directly applicable to enterprise environments where secret management, security compliance, and multi-cloud operations are critical business requirements.
