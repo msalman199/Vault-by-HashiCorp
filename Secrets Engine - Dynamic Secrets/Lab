@@ -1,0 +1,483 @@
+Secrets Engine - Dynamic Secrets
+Lab Objectives
+By the end of this lab, you will be able to:
+
+Understand the concept of dynamic secrets and their advantages over static secrets
+Configure HashiCorp Vault to generate dynamic secrets for AWS RDS databases
+Set up and configure the AWS secrets engine in Vault
+Create database connections and roles for dynamic secret generation
+Generate and test dynamic database credentials
+Verify the lifecycle management of dynamic secrets including automatic rotation and revocation
+Prerequisites
+Before starting this lab, you should have:
+
+Basic understanding of Linux command line operations
+Familiarity with database concepts and SQL
+Basic knowledge of AWS services, particularly RDS
+Understanding of HashiCorp Vault fundamentals
+Experience with JSON configuration files
+Basic networking concepts
+Lab Environment
+Al Nafi provides Linux-based cloud machines for this lab. Simply click Start Lab to access your dedicated Linux machine. The provided machine is bare metal with no pre-installed tools, so you will install all required software during the lab exercises.
+
+Task 1: Environment Setup and Vault Installation
+Subtask 1.1: Update System and Install Dependencies
+First, update your system and install the necessary dependencies:
+
+# Update package repositories
+sudo apt update && sudo apt upgrade -y
+
+# Install required packages
+sudo apt install -y curl wget unzip jq postgresql-client awscli
+
+# Install Docker for running PostgreSQL locally (simulating RDS)
+sudo apt install -y docker.io
+sudo systemctl start docker
+sudo systemctl enable docker
+sudo usermod -aG docker $USER
+Log out and log back in to apply the Docker group changes:
+
+exit
+Log back into your machine and verify Docker installation:
+
+docker --version
+Subtask 1.2: Install HashiCorp Vault
+Download and install the latest version of HashiCorp Vault:
+
+# Create a directory for Vault
+mkdir -p ~/vault-lab
+cd ~/vault-lab
+
+# Download Vault (check for latest version at releases.hashicorp.com)
+wget https://releases.hashicorp.com/vault/1.15.2/vault_1.15.2_linux_amd64.zip
+
+# Unzip and install Vault
+unzip vault_1.15.2_linux_amd64.zip
+sudo mv vault /usr/local/bin/
+sudo chmod +x /usr/local/bin/vault
+
+# Verify installation
+vault version
+Subtask 1.3: Configure Vault Server
+Create a Vault configuration file:
+
+# Create Vault configuration directory
+mkdir -p ~/vault-lab/config
+
+# Create Vault configuration file
+cat > ~/vault-lab/config/vault.hcl << 'EOF'
+storage "file" {
+  path = "/home/ubuntu/vault-lab/data"
+}
+
+listener "tcp" {
+  address = "127.0.0.1:8200"
+  tls_disable = true
+}
+
+api_addr = "http://127.0.0.1:8200"
+cluster_addr = "https://127.0.0.1:8201"
+ui = true
+disable_mlock = true
+EOF
+
+# Create data directory
+mkdir -p ~/vault-lab/data
+Subtask 1.4: Start and Initialize Vault
+Start the Vault server:
+
+# Start Vault server in the background
+cd ~/vault-lab
+vault server -config=config/vault.hcl > vault.log 2>&1 &
+
+# Wait for Vault to start
+sleep 5
+
+# Set Vault address environment variable
+export VAULT_ADDR='http://127.0.0.1:8200'
+echo 'export VAULT_ADDR="http://127.0.0.1:8200"' >> ~/.bashrc
+
+# Initialize Vault
+vault operator init -key-shares=1 -key-threshold=1 > vault-keys.txt
+
+# Extract unseal key and root token
+UNSEAL_KEY=$(grep 'Unseal Key 1:' vault-keys.txt | awk '{print $NF}')
+ROOT_TOKEN=$(grep 'Initial Root Token:' vault-keys.txt | awk '{print $NF}')
+
+# Unseal Vault
+vault operator unseal $UNSEAL_KEY
+
+# Authenticate with root token
+vault auth $ROOT_TOKEN
+Verify Vault is running and unsealed:
+
+vault status
+Task 2: Set Up Database Environment
+Subtask 2.1: Deploy PostgreSQL Database
+For this lab, we'll use PostgreSQL in a Docker container to simulate an AWS RDS instance:
+
+# Run PostgreSQL container
+docker run --name postgres-db \
+  -e POSTGRES_DB=testdb \
+  -e POSTGRES_USER=postgres \
+  -e POSTGRES_PASSWORD=rootpassword \
+  -p 5432:5432 \
+  -d postgres:13
+
+# Wait for PostgreSQL to start
+sleep 10
+
+# Verify PostgreSQL is running
+docker ps | grep postgres-db
+Subtask 2.2: Configure Database for Dynamic Secrets
+Connect to PostgreSQL and create necessary users and permissions:
+
+# Connect to PostgreSQL and create a vault user
+docker exec -it postgres-db psql -U postgres -d testdb << 'EOF'
+-- Create a user for Vault to manage dynamic users
+CREATE USER vault WITH PASSWORD 'vaultpassword';
+
+-- Grant necessary permissions to vault user
+ALTER USER vault CREATEDB;
+ALTER USER vault CREATEROLE;
+
+-- Create a test table for verification
+CREATE TABLE employees (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100),
+    department VARCHAR(50)
+);
+
+-- Insert sample data
+INSERT INTO employees (name, department) VALUES 
+('John Doe', 'Engineering'),
+('Jane Smith', 'Marketing'),
+('Bob Johnson', 'Sales');
+
+-- Grant permissions on the table
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO vault;
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO vault;
+
+\q
+EOF
+Verify the database setup:
+
+# Test connection with vault user
+PGPASSWORD=vaultpassword psql -h localhost -U vault -d testdb -c "SELECT * FROM employees;"
+Task 3: Configure Vault Database Secrets Engine
+Subtask 3.1: Enable Database Secrets Engine
+Enable and configure the database secrets engine in Vault:
+
+# Enable the database secrets engine
+vault secrets enable database
+
+# Verify the secrets engine is enabled
+vault secrets list
+Subtask 3.2: Configure Database Connection
+Configure Vault to connect to your PostgreSQL database:
+
+# Configure database connection
+vault write database/config/postgresql \
+    plugin_name=postgresql-database-plugin \
+    connection_url="postgresql://{{username}}:{{password}}@localhost:5432/testdb?sslmode=disable" \
+    allowed_roles="readonly,readwrite" \
+    username="vault" \
+    password="vaultpassword"
+
+# Verify the connection configuration
+vault read database/config/postgresql
+Subtask 3.3: Create Database Roles
+Create different roles for various access levels:
+
+# Create a read-only role
+vault write database/roles/readonly \
+    db_name=postgresql \
+    creation_statements="CREATE ROLE \"{{name}}\" WITH LOGIN PASSWORD '{{password}}' VALID UNTIL '{{expiration}}'; \
+        GRANT SELECT ON ALL TABLES IN SCHEMA public TO \"{{name}}\";" \
+    default_ttl="1h" \
+    max_ttl="24h"
+
+# Create a read-write role
+vault write database/roles/readwrite \
+    db_name=postgresql \
+    creation_statements="CREATE ROLE \"{{name}}\" WITH LOGIN PASSWORD '{{password}}' VALID UNTIL '{{expiration}}'; \
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO \"{{name}}\";" \
+    default_ttl="1h" \
+    max_ttl="24h"
+
+# Verify roles are created
+vault list database/roles
+vault read database/roles/readonly
+vault read database/roles/readwrite
+Task 4: Generate and Test Dynamic Secrets
+Subtask 4.1: Generate Dynamic Database Credentials
+Generate dynamic credentials for different roles:
+
+# Generate read-only credentials
+echo "=== Generating Read-Only Credentials ==="
+vault read database/creds/readonly
+
+# Store the credentials for testing
+READONLY_CREDS=$(vault read -format=json database/creds/readonly)
+READONLY_USER=$(echo $READONLY_CREDS | jq -r '.data.username')
+READONLY_PASS=$(echo $READONLY_CREDS | jq -r '.data.password')
+
+echo "Read-only Username: $READONLY_USER"
+echo "Read-only Password: $READONLY_PASS"
+
+# Generate read-write credentials
+echo "=== Generating Read-Write Credentials ==="
+vault read database/creds/readwrite
+
+# Store the credentials for testing
+READWRITE_CREDS=$(vault read -format=json database/creds/readwrite)
+READWRITE_USER=$(echo $READWRITE_CREDS | jq -r '.data.username')
+READWRITE_PASS=$(echo $READWRITE_CREDS | jq -r '.data.password')
+
+echo "Read-write Username: $READWRITE_USER"
+echo "Read-write Password: $READWRITE_PASS"
+Subtask 4.2: Test Read-Only Access
+Test the read-only credentials:
+
+echo "=== Testing Read-Only Access ==="
+
+# Test SELECT operation (should work)
+PGPASSWORD=$READONLY_PASS psql -h localhost -U $READONLY_USER -d testdb -c "SELECT * FROM employees;"
+
+# Test INSERT operation (should fail)
+echo "Attempting INSERT with read-only user (should fail):"
+PGPASSWORD=$READONLY_PASS psql -h localhost -U $READONLY_USER -d testdb -c "INSERT INTO employees (name, department) VALUES ('Test User', 'Test Dept');" 2>&1 || echo "INSERT failed as expected for read-only user"
+Subtask 4.3: Test Read-Write Access
+Test the read-write credentials:
+
+echo "=== Testing Read-Write Access ==="
+
+# Test SELECT operation (should work)
+PGPASSWORD=$READWRITE_PASS psql -h localhost -U $READWRITE_USER -d testdb -c "SELECT * FROM employees;"
+
+# Test INSERT operation (should work)
+echo "Attempting INSERT with read-write user (should succeed):"
+PGPASSWORD=$READWRITE_PASS psql -h localhost -U $READWRITE_USER -d testdb -c "INSERT INTO employees (name, department) VALUES ('Dynamic User', 'Test Department');"
+
+# Verify the insert worked
+PGPASSWORD=$READWRITE_PASS psql -h localhost -U $READWRITE_USER -d testdb -c "SELECT * FROM employees WHERE name = 'Dynamic User';"
+
+# Test UPDATE operation (should work)
+PGPASSWORD=$READWRITE_PASS psql -h localhost -U $READWRITE_USER -d testdb -c "UPDATE employees SET department = 'Updated Department' WHERE name = 'Dynamic User';"
+
+# Verify the update worked
+PGPASSWORD=$READWRITE_PASS psql -h localhost -U $READWRITE_USER -d testdb -c "SELECT * FROM employees WHERE name = 'Dynamic User';"
+Task 5: Demonstrate Dynamic Secret Lifecycle
+Subtask 5.1: Monitor Active Leases
+Check active leases for dynamic secrets:
+
+# List all active leases
+vault list sys/leases/lookup/database/creds/readonly
+vault list sys/leases/lookup/database/creds/readwrite
+
+# Get detailed information about a specific lease
+echo "=== Lease Information ==="
+vault write sys/leases/lookup lease_id=$(vault read -field=lease_id database/creds/readonly)
+Subtask 5.2: Renew Dynamic Secrets
+Demonstrate lease renewal:
+
+# Generate new credentials and capture lease ID
+NEW_CREDS=$(vault read -format=json database/creds/readonly)
+LEASE_ID=$(echo $NEW_CREDS | jq -r '.lease_id')
+NEW_USER=$(echo $NEW_CREDS | jq -r '.data.username')
+NEW_PASS=$(echo $NEW_CREDS | jq -r '.data.password')
+
+echo "New Lease ID: $LEASE_ID"
+echo "New Username: $NEW_USER"
+
+# Test the credentials work
+PGPASSWORD=$NEW_PASS psql -h localhost -U $NEW_USER -d testdb -c "SELECT COUNT(*) FROM employees;"
+
+# Renew the lease
+echo "=== Renewing Lease ==="
+vault write sys/leases/renew lease_id=$LEASE_ID increment=3600
+
+# Check lease information after renewal
+vault write sys/leases/lookup lease_id=$LEASE_ID
+Subtask 5.3: Revoke Dynamic Secrets
+Demonstrate secret revocation:
+
+# Test that credentials work before revocation
+echo "=== Testing Credentials Before Revocation ==="
+PGPASSWORD=$NEW_PASS psql -h localhost -U $NEW_USER -d testdb -c "SELECT 'Credentials work before revocation' as status;"
+
+# Revoke the lease
+echo "=== Revoking Lease ==="
+vault write sys/leases/revoke lease_id=$LEASE_ID
+
+# Wait a moment for revocation to take effect
+sleep 5
+
+# Test that credentials no longer work after revocation
+echo "=== Testing Credentials After Revocation (should fail) ==="
+PGPASSWORD=$NEW_PASS psql -h localhost -U $NEW_USER -d testdb -c "SELECT 'This should fail' as status;" 2>&1 || echo "Credentials successfully revoked - access denied as expected"
+
+# Verify user was removed from database
+docker exec -it postgres-db psql -U postgres -d testdb -c "SELECT usename FROM pg_user WHERE usename = '$NEW_USER';"
+Task 6: Advanced Dynamic Secrets Configuration
+Subtask 6.1: Configure Custom TTL and Rotation
+Create a role with custom TTL settings:
+
+# Create a role with shorter TTL for demonstration
+vault write database/roles/short-lived \
+    db_name=postgresql \
+    creation_statements="CREATE ROLE \"{{name}}\" WITH LOGIN PASSWORD '{{password}}' VALID UNTIL '{{expiration}}'; \
+        GRANT SELECT ON ALL TABLES IN SCHEMA public TO \"{{name}}\";" \
+    default_ttl="5m" \
+    max_ttl="10m"
+
+# Generate credentials with short TTL
+echo "=== Generating Short-Lived Credentials ==="
+SHORT_CREDS=$(vault read -format=json database/creds/short-lived)
+SHORT_USER=$(echo $SHORT_CREDS | jq -r '.data.username')
+SHORT_PASS=$(echo $SHORT_CREDS | jq -r '.data.password')
+SHORT_LEASE=$(echo $SHORT_CREDS | jq -r '.lease_id')
+
+echo "Short-lived Username: $SHORT_USER"
+echo "Lease Duration: $(echo $SHORT_CREDS | jq -r '.lease_duration') seconds"
+
+# Test the credentials
+PGPASSWORD=$SHORT_PASS psql -h localhost -U $SHORT_USER -d testdb -c "SELECT 'Short-lived credentials work' as status;"
+Subtask 6.2: Bulk Revocation
+Demonstrate bulk revocation of secrets:
+
+# Generate multiple credentials
+echo "=== Generating Multiple Credentials for Bulk Revocation ==="
+for i in {1..3}; do
+    vault read database/creds/readonly > /dev/null
+    echo "Generated credential set $i"
+done
+
+# List all active leases
+echo "=== Active Leases Before Bulk Revocation ==="
+vault list sys/leases/lookup/database/creds/readonly
+
+# Revoke all leases for the readonly role
+echo "=== Performing Bulk Revocation ==="
+vault write sys/leases/revoke-prefix prefix=database/creds/readonly
+
+# Verify leases are revoked
+echo "=== Active Leases After Bulk Revocation ==="
+vault list sys/leases/lookup/database/creds/readonly 2>/dev/null || echo "No active leases found - bulk revocation successful"
+Task 7: Monitoring and Auditing
+Subtask 7.1: Enable Audit Logging
+Enable audit logging to track dynamic secret operations:
+
+# Enable file audit logging
+vault audit enable file file_path=/home/ubuntu/vault-lab/audit.log
+
+# Generate some activity to audit
+vault read database/creds/readonly > /dev/null
+vault read database/creds/readwrite > /dev/null
+
+# Check audit log
+echo "=== Recent Audit Log Entries ==="
+tail -n 5 ~/vault-lab/audit.log | jq '.request.path, .response.data.username'
+Subtask 7.2: Monitor Database Connections
+Check database connections and users:
+
+# Check active database connections
+echo "=== Active Database Connections ==="
+docker exec -it postgres-db psql -U postgres -d testdb -c "SELECT usename, application_name, client_addr, state FROM pg_stat_activity WHERE usename LIKE 'v-token-%';"
+
+# Check all vault-created users
+echo "=== All Vault-Created Database Users ==="
+docker exec -it postgres-db psql -U postgres -d testdb -c "SELECT usename, valuntil FROM pg_user WHERE usename LIKE 'v-token-%';"
+Troubleshooting Common Issues
+Issue 1: Database Connection Failures
+If you encounter database connection issues:
+
+# Check if PostgreSQL container is running
+docker ps | grep postgres-db
+
+# Check PostgreSQL logs
+docker logs postgres-db
+
+# Test direct connection
+PGPASSWORD=vaultpassword psql -h localhost -U vault -d testdb -c "SELECT 1;"
+
+# Restart PostgreSQL if needed
+docker restart postgres-db
+Issue 2: Vault Seal Status
+If Vault becomes sealed:
+
+# Check Vault status
+vault status
+
+# Unseal if needed
+vault operator unseal $UNSEAL_KEY
+Issue 3: Permission Denied Errors
+If you get permission errors:
+
+# Check if vault user has proper permissions
+docker exec -it postgres-db psql -U postgres -d testdb -c "SELECT rolname, rolcreaterole, rolcreatedb FROM pg_roles WHERE rolname = 'vault';"
+
+# Re-grant permissions if needed
+docker exec -it postgres-db psql -U postgres -d testdb -c "ALTER USER vault CREATEDB; ALTER USER vault CREATEROLE;"
+Lab Verification
+Verification Checklist
+Verify your lab completion by checking the following:
+
+# 1. Verify Vault is running and unsealed
+vault status
+
+# 2. Verify database secrets engine is enabled
+vault secrets list | grep database
+
+# 3. Verify database connection is configured
+vault read database/config/postgresql
+
+# 4. Verify roles are created
+vault list database/roles
+
+# 5. Generate and test new credentials
+TEST_CREDS=$(vault read -format=json database/creds/readonly)
+TEST_USER=$(echo $TEST_CREDS | jq -r '.data.username')
+TEST_PASS=$(echo $TEST_CREDS | jq -r '.data.password')
+
+PGPASSWORD=$TEST_PASS psql -h localhost -U $TEST_USER -d testdb -c "SELECT 'Lab verification successful' as result;"
+
+# 6. Verify audit logging is working
+tail -n 1 ~/vault-lab/audit.log | jq '.type'
+Cleanup
+To clean up the lab environment:
+
+# Revoke all active leases
+vault write sys/leases/revoke-prefix prefix=database/
+
+# Stop and remove PostgreSQL container
+docker stop postgres-db
+docker rm postgres-db
+
+# Stop Vault server
+pkill vault
+
+# Remove lab files (optional)
+# rm -rf ~/vault-lab
+Conclusion
+In this lab, you have successfully:
+
+Configured HashiCorp Vault to generate dynamic secrets for database access
+Set up a PostgreSQL database environment for testing dynamic credentials
+Created database roles with different permission levels (read-only and read-write)
+Generated and tested dynamic database credentials that automatically expire
+Demonstrated the complete lifecycle of dynamic secrets including creation, renewal, and revocation
+Implemented monitoring and auditing for dynamic secret operations
+Learned troubleshooting techniques for common dynamic secrets issues
+Why This Matters:
+
+Dynamic secrets represent a significant security improvement over static credentials because they:
+
+Eliminate credential sprawl by generating unique, time-limited credentials for each access request
+Reduce the blast radius of compromised credentials since they automatically expire
+Provide detailed audit trails of who accessed what resources and when
+Enable automatic rotation without manual intervention or application downtime
+Support the principle of least privilege by generating credentials with only the necessary permissions
+This approach is particularly valuable in cloud-native environments, microservices architectures, and DevOps workflows where applications need secure, automated access to databases and other services. The skills you've learned in this lab form the foundation for implementing zero-trust security models and automated credential management in production environments.
+
+The dynamic secrets capability you've explored can be extended to other services including AWS IAM, Azure, Google Cloud Platform, SSH access, and many other systems, making it a versatile tool for comprehensive secrets management across your entire infrastructure.
