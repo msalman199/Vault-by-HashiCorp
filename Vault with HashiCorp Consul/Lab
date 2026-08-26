@@ -1,0 +1,622 @@
+Vault with HashiCorp Consul
+Lab Objectives
+By the end of this lab, you will be able to:
+
+Install and configure HashiCorp Consul as a distributed key-value store
+Set up HashiCorp Vault with Consul as the storage backend
+Configure Consul for service discovery with Vault
+Understand the integration between Vault and Consul for high availability
+Perform basic operations with Vault using Consul backend
+Verify service registration and discovery functionality
+Prerequisites
+Before starting this lab, you should have:
+
+Basic understanding of Linux command line operations
+Familiarity with JSON configuration files
+Basic knowledge of distributed systems concepts
+Understanding of key-value storage principles
+Previous experience with HashiCorp Vault basics (recommended)
+Lab Environment
+Al Nafi provides Linux-based cloud machines for this lab. Simply click Start Lab to access your dedicated Linux machine. The provided machine is bare metal with no pre-installed tools, so you will install all required software during the lab exercises.
+
+Task 1: Set up Vault with Consul as the Storage Backend
+Subtask 1.1: Install Required Dependencies
+First, update your system and install necessary packages:
+
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y wget unzip curl jq net-tools
+Subtask 1.2: Install HashiCorp Consul
+Download and install the latest version of Consul:
+
+# Create a directory for HashiCorp tools
+mkdir -p ~/hashicorp
+cd ~/hashicorp
+
+# Download Consul
+CONSUL_VERSION="1.17.0"
+wget https://releases.hashicorp.com/consul/${CONSUL_VERSION}/consul_${CONSUL_VERSION}_linux_amd64.zip
+
+# Extract and install Consul
+unzip consul_${CONSUL_VERSION}_linux_amd64.zip
+sudo mv consul /usr/local/bin/
+sudo chmod +x /usr/local/bin/consul
+
+# Verify installation
+consul version
+Subtask 1.3: Create Consul Configuration
+Create the necessary directories and configuration files for Consul:
+
+# Create Consul directories
+sudo mkdir -p /etc/consul.d
+sudo mkdir -p /var/lib/consul
+sudo mkdir -p /var/log/consul
+
+# Create Consul user
+sudo useradd --system --home /etc/consul.d --shell /bin/false consul
+sudo chown -R consul:consul /etc/consul.d /var/lib/consul /var/log/consul
+Create the main Consul configuration file:
+
+sudo tee /etc/consul.d/consul.json > /dev/null <<EOF
+{
+  "datacenter": "dc1",
+  "data_dir": "/var/lib/consul",
+  "log_level": "INFO",
+  "node_name": "consul-node-1",
+  "bind_addr": "127.0.0.1",
+  "client_addr": "127.0.0.1",
+  "retry_join": ["127.0.0.1"],
+  "server": true,
+  "bootstrap_expect": 1,
+  "ui_config": {
+    "enabled": true
+  },
+  "connect": {
+    "enabled": true
+  },
+  "ports": {
+    "grpc": 8502
+  }
+}
+EOF
+Subtask 1.4: Create Consul Service
+Create a systemd service file for Consul:
+
+sudo tee /etc/systemd/system/consul.service > /dev/null <<EOF
+[Unit]
+Description=Consul
+Documentation=https://www.consul.io/
+Requires=network-online.target
+After=network-online.target
+ConditionFileNotEmpty=/etc/consul.d/consul.json
+
+[Service]
+Type=notify
+User=consul
+Group=consul
+ExecStart=/usr/local/bin/consul agent -config-dir=/etc/consul.d/
+ExecReload=/bin/kill -HUP \$MAINPID
+KillMode=process
+Restart=on-failure
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+Subtask 1.5: Start and Enable Consul Service
+Start the Consul service and verify it's running:
+
+# Reload systemd and start Consul
+sudo systemctl daemon-reload
+sudo systemctl enable consul
+sudo systemctl start consul
+
+# Check service status
+sudo systemctl status consul
+
+# Verify Consul is running
+consul members
+consul catalog services
+Subtask 1.6: Install HashiCorp Vault
+Download and install Vault:
+
+cd ~/hashicorp
+
+# Download Vault
+VAULT_VERSION="1.15.2"
+wget https://releases.hashicorp.com/vault/${VAULT_VERSION}/vault_${VAULT_VERSION}_linux_amd64.zip
+
+# Extract and install Vault
+unzip vault_${VAULT_VERSION}_linux_amd64.zip
+sudo mv vault /usr/local/bin/
+sudo chmod +x /usr/local/bin/vault
+
+# Verify installation
+vault version
+Subtask 1.7: Configure Vault with Consul Backend
+Create directories for Vault:
+
+sudo mkdir -p /etc/vault.d
+sudo mkdir -p /var/lib/vault
+sudo mkdir -p /var/log/vault
+
+# Create Vault user
+sudo useradd --system --home /etc/vault.d --shell /bin/false vault
+sudo chown -R vault:vault /etc/vault.d /var/lib/vault /var/log/vault
+Create Vault configuration file with Consul as storage backend:
+
+sudo tee /etc/vault.d/vault.hcl > /dev/null <<EOF
+storage "consul" {
+  address = "127.0.0.1:8500"
+  path    = "vault/"
+}
+
+listener "tcp" {
+  address     = "127.0.0.1:8200"
+  tls_disable = 1
+}
+
+api_addr = "http://127.0.0.1:8200"
+cluster_addr = "https://127.0.0.1:8201"
+ui = true
+
+# Disable mlock for development
+disable_mlock = true
+EOF
+Subtask 1.8: Create Vault Service
+Create a systemd service file for Vault:
+
+sudo tee /etc/systemd/system/vault.service > /dev/null <<EOF
+[Unit]
+Description=HashiCorp Vault
+Documentation=https://www.vaultproject.io/docs/
+Requires=network-online.target
+After=network-online.target
+ConditionFileNotEmpty=/etc/vault.d/vault.hcl
+
+[Service]
+Type=notify
+User=vault
+Group=vault
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+SecureBits=keep-caps
+AmbientCapabilities=CAP_IPC_LOCK
+Capabilities=CAP_IPC_LOCK+ep
+CapabilityBoundingSet=CAP_SYSLOG CAP_IPC_LOCK
+NoNewPrivileges=yes
+ExecStart=/usr/local/bin/vault server -config=/etc/vault.d/vault.hcl
+ExecReload=/bin/kill --signal HUP \$MAINPID
+KillMode=process
+KillSignal=SIGINT
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+StartLimitInterval=60
+StartLimitBurst=3
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target
+EOF
+Subtask 1.9: Start Vault Service
+Start and enable the Vault service:
+
+# Reload systemd and start Vault
+sudo systemctl daemon-reload
+sudo systemctl enable vault
+sudo systemctl start vault
+
+# Check service status
+sudo systemctl status vault
+
+# Set Vault address environment variable
+export VAULT_ADDR='http://127.0.0.1:8200'
+echo 'export VAULT_ADDR="http://127.0.0.1:8200"' >> ~/.bashrc
+Subtask 1.10: Initialize and Unseal Vault
+Initialize Vault and save the keys:
+
+# Initialize Vault
+vault operator init -key-shares=5 -key-threshold=3 > ~/vault-keys.txt
+
+# Display the keys (save these securely in production)
+cat ~/vault-keys.txt
+
+# Extract unseal keys and root token
+UNSEAL_KEY_1=$(grep 'Unseal Key 1:' ~/vault-keys.txt | awk '{print $4}')
+UNSEAL_KEY_2=$(grep 'Unseal Key 2:' ~/vault-keys.txt | awk '{print $4}')
+UNSEAL_KEY_3=$(grep 'Unseal Key 3:' ~/vault-keys.txt | awk '{print $4}')
+ROOT_TOKEN=$(grep 'Initial Root Token:' ~/vault-keys.txt | awk '{print $4}')
+
+# Unseal Vault
+vault operator unseal $UNSEAL_KEY_1
+vault operator unseal $UNSEAL_KEY_2
+vault operator unseal $UNSEAL_KEY_3
+
+# Check Vault status
+vault status
+Subtask 1.11: Verify Consul Storage Integration
+Login to Vault and verify the Consul integration:
+
+# Login with root token
+vault auth $ROOT_TOKEN
+
+# Check Vault status
+vault status
+
+# Verify data is stored in Consul
+consul kv get -recurse vault/
+
+# Check Consul UI (if accessible)
+echo "Consul UI available at: http://127.0.0.1:8500"
+echo "Vault UI available at: http://127.0.0.1:8200"
+Task 2: Use Consul for Service Discovery
+Subtask 2.1: Register Vault Service in Consul
+Create a service definition for Vault in Consul:
+
+sudo tee /etc/consul.d/vault-service.json > /dev/null <<EOF
+{
+  "service": {
+    "name": "vault",
+    "tags": ["secure", "storage"],
+    "address": "127.0.0.1",
+    "port": 8200,
+    "check": {
+      "http": "http://127.0.0.1:8200/v1/sys/health",
+      "interval": "10s"
+    }
+  }
+}
+EOF
+Reload Consul to register the service:
+
+# Reload Consul configuration
+sudo systemctl reload consul
+
+# Wait a moment for the service to register
+sleep 5
+
+# Verify service registration
+consul catalog services
+consul catalog nodes -service=vault
+Subtask 2.2: Create Additional Service Definitions
+Create a sample application service to demonstrate service discovery:
+
+sudo tee /etc/consul.d/sample-app.json > /dev/null <<EOF
+{
+  "service": {
+    "name": "sample-app",
+    "tags": ["web", "application"],
+    "address": "127.0.0.1",
+    "port": 3000,
+    "check": {
+      "tcp": "127.0.0.1:3000",
+      "interval": "10s",
+      "timeout": "3s"
+    }
+  }
+}
+EOF
+Subtask 2.3: Query Services Using Consul API
+Test service discovery functionality:
+
+# List all services
+curl -s http://127.0.0.1:8500/v1/catalog/services | jq
+
+# Get Vault service details
+curl -s http://127.0.0.1:8500/v1/catalog/service/vault | jq
+
+# Get service health status
+curl -s http://127.0.0.1:8500/v1/health/service/vault | jq
+
+# Query using DNS interface
+dig @127.0.0.1 -p 8600 vault.service.consul
+Subtask 2.4: Configure Vault to Use Consul for Service Discovery
+Update Vault configuration to include service registration:
+
+sudo tee /etc/vault.d/vault.hcl > /dev/null <<EOF
+storage "consul" {
+  address = "127.0.0.1:8500"
+  path    = "vault/"
+}
+
+listener "tcp" {
+  address     = "127.0.0.1:8200"
+  tls_disable = 1
+}
+
+service_registration "consul" {
+  address = "127.0.0.1:8500"
+}
+
+api_addr = "http://127.0.0.1:8200"
+cluster_addr = "https://127.0.0.1:8201"
+ui = true
+
+# Disable mlock for development
+disable_mlock = true
+EOF
+Restart Vault to apply the new configuration:
+
+sudo systemctl restart vault
+
+# Wait for Vault to start
+sleep 10
+
+# Unseal Vault again
+vault operator unseal $UNSEAL_KEY_1
+vault operator unseal $UNSEAL_KEY_2
+vault operator unseal $UNSEAL_KEY_3
+
+# Verify service registration
+consul catalog services
+Subtask 2.5: Test Service Discovery Integration
+Create a simple script to demonstrate service discovery:
+
+tee ~/service-discovery-test.sh > /dev/null <<'EOF'
+#!/bin/bash
+
+echo "=== Service Discovery Test ==="
+echo
+
+echo "1. Available services:"
+consul catalog services
+echo
+
+echo "2. Vault service details:"
+consul catalog service vault
+echo
+
+echo "3. Service health check:"
+curl -s http://127.0.0.1:8500/v1/health/service/vault | jq '.[] | {Node: .Node.Node, ServiceID: .Service.ID, Status: .Checks[].Status}'
+echo
+
+echo "4. DNS resolution:"
+dig @127.0.0.1 -p 8600 vault.service.consul SRV +short
+echo
+
+echo "5. Vault status via discovered service:"
+VAULT_IP=$(dig @127.0.0.1 -p 8600 vault.service.consul +short | head -1)
+if [ ! -z "$VAULT_IP" ]; then
+    curl -s http://$VAULT_IP:8200/v1/sys/health | jq
+else
+    echo "Could not resolve Vault service"
+fi
+EOF
+
+chmod +x ~/service-discovery-test.sh
+~/service-discovery-test.sh
+Subtask 2.6: Monitor Service Health
+Set up monitoring for the services:
+
+# Check service health status
+consul catalog service vault -detailed
+
+# Monitor health checks
+watch -n 5 'consul catalog service vault | grep -E "(ServiceID|Address|ServicePort)"'
+Create a health monitoring script:
+
+tee ~/health-monitor.sh > /dev/null <<'EOF'
+#!/bin/bash
+
+echo "=== Health Monitoring Dashboard ==="
+echo "Timestamp: $(date)"
+echo
+
+echo "Consul Status:"
+consul members
+echo
+
+echo "Vault Status:"
+vault status 2>/dev/null || echo "Vault is sealed or unavailable"
+echo
+
+echo "Service Health Checks:"
+consul catalog service vault | grep -E "(Node|Address|ServicePort|ServiceTags)"
+echo
+
+echo "Failed Health Checks:"
+curl -s http://127.0.0.1:8500/v1/health/state/critical | jq '.[] | {Service: .ServiceName, Node: .Node, Status: .Status, Output: .Output}'
+EOF
+
+chmod +x ~/health-monitor.sh
+~/health-monitor.sh
+Subtask 2.7: Test High Availability Scenarios
+Simulate service failures and recovery:
+
+# Test 1: Stop Vault and observe service discovery
+echo "Testing service failure detection..."
+sudo systemctl stop vault
+
+# Wait and check service status
+sleep 15
+consul catalog service vault
+curl -s http://127.0.0.1:8500/v1/health/service/vault | jq '.[] | {Status: .Checks[].Status}'
+
+# Restart Vault
+sudo systemctl start vault
+sleep 10
+
+# Unseal Vault
+vault operator unseal $UNSEAL_KEY_1
+vault operator unseal $UNSEAL_KEY_2
+vault operator unseal $UNSEAL_KEY_3
+
+# Verify service recovery
+consul catalog service vault
+Subtask 2.8: Create Service Discovery Client Example
+Create a sample application that uses Consul for service discovery:
+
+tee ~/consul-client-example.py > /dev/null <<'EOF'
+#!/usr/bin/env python3
+
+import requests
+import json
+import time
+
+def discover_vault_service():
+    """Discover Vault service using Consul API"""
+    try:
+        response = requests.get('http://127.0.0.1:8500/v1/catalog/service/vault')
+        services = response.json()
+        
+        if services:
+            service = services[0]
+            return f"http://{service['ServiceAddress']}:{service['ServicePort']}"
+        else:
+            return None
+    except Exception as e:
+        print(f"Error discovering service: {e}")
+        return None
+
+def check_vault_health(vault_url):
+    """Check Vault health status"""
+    try:
+        response = requests.get(f"{vault_url}/v1/sys/health")
+        return response.json()
+    except Exception as e:
+        print(f"Error checking Vault health: {e}")
+        return None
+
+def main():
+    print("=== Consul Service Discovery Client ===")
+    
+    # Discover Vault service
+    vault_url = discover_vault_service()
+    
+    if vault_url:
+        print(f"Discovered Vault service at: {vault_url}")
+        
+        # Check health
+        health = check_vault_health(vault_url)
+        if health:
+            print(f"Vault Health Status: {json.dumps(health, indent=2)}")
+        else:
+            print("Could not retrieve Vault health status")
+    else:
+        print("Could not discover Vault service")
+
+if __name__ == "__main__":
+    main()
+EOF
+
+# Install Python requests if needed
+sudo apt install -y python3-pip
+pip3 install requests
+
+# Run the example
+python3 ~/consul-client-example.py
+Verification and Testing
+Comprehensive System Test
+Run a complete verification of the setup:
+
+tee ~/complete-verification.sh > /dev/null <<'EOF'
+#!/bin/bash
+
+echo "=== Complete Vault-Consul Integration Verification ==="
+echo
+
+# Test 1: Consul Status
+echo "1. Consul Cluster Status:"
+consul members
+echo
+
+# Test 2: Vault Status
+echo "2. Vault Status:"
+vault status
+echo
+
+# Test 3: Storage Backend Verification
+echo "3. Consul Storage Backend:"
+consul kv get -recurse vault/ | head -10
+echo
+
+# Test 4: Service Registration
+echo "4. Registered Services:"
+consul catalog services
+echo
+
+# Test 5: Service Health
+echo "5. Service Health Checks:"
+curl -s http://127.0.0.1:8500/v1/health/service/vault | jq '.[] | {Node: .Node.Node, Service: .Service.Service, Status: .Checks[].Status}'
+echo
+
+# Test 6: Vault Operations
+echo "6. Vault Operations Test:"
+vault auth $ROOT_TOKEN > /dev/null 2>&1
+vault secrets enable -path=test kv
+vault kv put test/hello value=world
+vault kv get test/hello
+echo
+
+# Test 7: Data Persistence in Consul
+echo "7. Data Persistence Check:"
+consul kv get -recurse vault/logical | head -5
+echo
+
+echo "=== Verification Complete ==="
+EOF
+
+chmod +x ~/complete-verification.sh
+~/complete-verification.sh
+Troubleshooting Common Issues
+Issue 1: Consul Connection Problems
+# Check Consul connectivity
+curl -s http://127.0.0.1:8500/v1/status/leader
+netstat -tlnp | grep :8500
+
+# Restart Consul if needed
+sudo systemctl restart consul
+Issue 2: Vault Seal Status
+# Check if Vault is sealed
+vault status
+
+# Unseal if necessary
+vault operator unseal $UNSEAL_KEY_1
+vault operator unseal $UNSEAL_KEY_2
+vault operator unseal $UNSEAL_KEY_3
+Issue 3: Service Registration Issues
+# Check service definitions
+ls -la /etc/consul.d/
+sudo systemctl reload consul
+
+# Verify service registration
+consul catalog services
+Cleanup (Optional)
+To clean up the lab environment:
+
+# Stop services
+sudo systemctl stop vault consul
+
+# Remove service files
+sudo rm /etc/systemd/system/vault.service
+sudo rm /etc/systemd/system/consul.service
+
+# Remove configuration directories
+sudo rm -rf /etc/vault.d /etc/consul.d
+sudo rm -rf /var/lib/vault /var/lib/consul
+
+# Remove users
+sudo userdel vault
+sudo userdel consul
+
+# Remove binaries
+sudo rm /usr/local/bin/vault /usr/local/bin/consul
+Conclusion
+In this lab, you have successfully:
+
+Installed and configured HashiCorp Consul as a distributed key-value store and service discovery platform
+Set up HashiCorp Vault with Consul as the storage backend, demonstrating how these tools integrate for enterprise-grade secret management
+Configured service registration and discovery using Consul's service catalog and health checking capabilities
+Implemented monitoring and health checks to ensure service availability and reliability
+Created practical examples of service discovery clients that can dynamically locate and connect to services
+Tested high availability scenarios including service failures and recovery procedures
+This integration between Vault and Consul provides several key benefits:
+
+High Availability: Consul's distributed architecture ensures Vault data is replicated and available even if individual nodes fail
+Service Discovery: Applications can dynamically discover Vault instances without hardcoded addresses
+Health Monitoring: Automatic health checks ensure only healthy Vault instances receive traffic
+Scalability: The combination supports horizontal scaling of both storage and secret management capabilities
+Understanding this integration is crucial for building resilient, production-ready infrastructure that can handle enterprise-scale secret management requirements. The skills you've developed in this lab form the foundation for implementing secure, distributed systems using HashiCorp's ecosystem of tools.
