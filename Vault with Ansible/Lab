@@ -1,0 +1,518 @@
+Vault with Ansible
+Lab Objectives
+By the end of this lab, you will be able to:
+
+Install and configure HashiCorp Vault on a Linux system
+Install and configure Ansible for automation tasks
+Create Ansible playbooks to automate Vault deployment
+Use Ansible to manage Vault secrets and policies
+Verify automated secret retrieval and monitor Vault's operational health
+Prerequisites
+Before starting this lab, you should have:
+
+Basic understanding of Linux command line operations
+Familiarity with YAML syntax
+Basic knowledge of configuration management concepts
+Understanding of secret management principles
+Experience with text editors (nano, vim, or similar)
+This lab is intended to be run on a dedicated, isolated Linux practice machine (a disposable VM or lab sandbox) that you own or control. All secrets, tokens, and credentials created in this lab are for local, educational use only and must never be reused in production systems.
+
+Install the required tools before starting:
+
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y curl wget unzip python3 python3-pip jq gnupg lsb-release
+python3 --version
+pip3 --version
+Lab Environment
+Al Nafi provides Linux-based cloud machines for this lab. Simply click Start Lab to access your dedicated Linux machine. The provided machine is bare metal with no pre-installed tools, so you will install all required software during the lab exercises.
+
+Task 1: Install Ansible and Vault, Then Deploy Vault with a Playbook
+Subtask 1.1: Install Ansible
+pip3 install --user ansible
+
+echo 'export PATH=$PATH:~/.local/bin' >> ~/.bashrc
+export PATH=$PATH:~/.local/bin
+
+ansible --version
+Expected result: ansible --version prints the Ansible core version (for example ansible [core 2.x.x]) along with the Python interpreter path.
+
+Subtask 1.2: Install HashiCorp Vault
+Use the official HashiCorp APT repository so the install stays correct regardless of the exact release version.
+
+wget -O- https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+
+echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+
+sudo apt update
+sudo apt install -y vault
+
+vault version
+Expected result: vault version prints something like Vault v1.x.x. If your distribution codename is not supported by the HashiCorp repo, download the matching zip for your architecture from releases.hashicorp.com/vault instead and place the binary in /usr/local/bin/vault.
+
+Subtask 1.3: Create the Project Directory Structure
+mkdir -p ~/vault-ansible-lab/{playbooks,inventory,roles/vault/{tasks,templates,defaults,handlers}}
+cd ~/vault-ansible-lab
+
+cat > inventory/hosts << 'EOF'
+[vault_servers]
+localhost ansible_connection=local
+
+[vault_servers:vars]
+vault_port=8200
+vault_address=127.0.0.1
+EOF
+Deliverable: running cat ~/vault-ansible-lab/inventory/hosts shows the inventory content above.
+
+Subtask 1.4: Create the Vault Role (Config, Service, Defaults, Handlers)
+cat > ~/vault-ansible-lab/roles/vault/defaults/main.yml << 'EOF'
+---
+vault_port: 8200
+vault_address: "127.0.0.1"
+vault_user: "vault"
+vault_group: "vault"
+vault_config_dir: "/etc/vault.d"
+vault_data_dir: "/opt/vault/data"
+EOF
+
+cat > ~/vault-ansible-lab/roles/vault/templates/vault.hcl.j2 << 'EOF'
+ui = true
+disable_mlock = true
+
+storage "file" {
+  path = "{{ vault_data_dir }}"
+}
+
+listener "tcp" {
+  address     = "{{ vault_address }}:{{ vault_port }}"
+  tls_disable = true
+}
+
+api_addr = "http://{{ vault_address }}:{{ vault_port }}"
+EOF
+
+cat > ~/vault-ansible-lab/roles/vault/templates/vault.service.j2 << 'EOF'
+[Unit]
+Description=HashiCorp Vault
+Documentation=https://www.vaultproject.io/docs/
+Requires=network-online.target
+After=network-online.target
+ConditionFileNotEmpty={{ vault_config_dir }}/vault.hcl
+
+[Service]
+Type=notify
+User={{ vault_user }}
+Group={{ vault_group }}
+ExecStart=/usr/bin/vault server -config={{ vault_config_dir }}/vault.hcl
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=process
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat > ~/vault-ansible-lab/roles/vault/handlers/main.yml << 'EOF'
+---
+- name: reload systemd
+  systemd:
+    daemon_reload: yes
+  become: yes
+
+- name: restart vault
+  systemd:
+    name: vault
+    state: restarted
+  become: yes
+EOF
+
+cat > ~/vault-ansible-lab/roles/vault/tasks/main.yml << 'EOF'
+---
+- name: Create vault group
+  group:
+    name: "{{ vault_group }}"
+    system: yes
+  become: yes
+
+- name: Create vault user
+  user:
+    name: "{{ vault_user }}"
+    group: "{{ vault_group }}"
+    system: yes
+    shell: /usr/sbin/nologin
+    createhome: no
+  become: yes
+
+- name: Create vault directories
+  file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ vault_user }}"
+    group: "{{ vault_group }}"
+    mode: '0750'
+  loop:
+    - "{{ vault_config_dir }}"
+    - "{{ vault_data_dir }}"
+  become: yes
+
+- name: Generate vault configuration
+  template:
+    src: vault.hcl.j2
+    dest: "{{ vault_config_dir }}/vault.hcl"
+    owner: "{{ vault_user }}"
+    group: "{{ vault_group }}"
+    mode: '0640'
+  become: yes
+  notify: restart vault
+
+- name: Create vault systemd service
+  template:
+    src: vault.service.j2
+    dest: /etc/systemd/system/vault.service
+    owner: root
+    group: root
+    mode: '0644'
+  become: yes
+  notify:
+    - reload systemd
+    - restart vault
+
+- name: Start and enable vault service
+  systemd:
+    name: vault
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  become: yes
+
+- name: Wait for vault API to respond
+  uri:
+    url: "http://{{ vault_address }}:{{ vault_port }}/v1/sys/health"
+    method: GET
+    status_code: [200, 429, 472, 473, 501, 503]
+  register: vault_health_check
+  until: vault_health_check.status is defined
+  retries: 10
+  delay: 3
+EOF
+Subtask 1.5: Create and Run the Deployment Playbook
+cat > ~/vault-ansible-lab/playbooks/deploy-vault.yml << 'EOF'
+---
+- name: Deploy HashiCorp Vault
+  hosts: vault_servers
+  become: yes
+  roles:
+    - vault
+
+  post_tasks:
+    - name: Show vault status
+      command: vault status
+      environment:
+        VAULT_ADDR: "http://{{ vault_address }}:{{ vault_port }}"
+      register: vault_status
+      failed_when: false
+      changed_when: false
+
+    - name: Display vault status output
+      debug:
+        var: vault_status.stdout_lines
+EOF
+
+cd ~/vault-ansible-lab
+ansible-playbook -i inventory/hosts playbooks/deploy-vault.yml
+Deliverable and expected result: the playbook run ends with PLAY RECAP showing failed=0, and the debug task prints vault_status.stdout_lines including a line Sealed true (Vault is installed and running but not yet initialized/unsealed). Confirm independently:
+
+sudo systemctl status vault --no-pager
+export VAULT_ADDR='http://127.0.0.1:8200'
+vault status
+You should see active (running) in the systemd status and Vault's status table showing Initialized: false and Sealed: true.
+
+Task 2: Automate Initialization, Policies, and Secrets with Ansible
+Subtask 2.1: Initialize and Unseal Vault
+cat > ~/vault-ansible-lab/playbooks/initialize-vault.yml << 'EOF'
+---
+- name: Initialize and Unseal Vault
+  hosts: vault_servers
+  gather_facts: no
+  vars:
+    vault_addr: "http://{{ vault_address }}:{{ vault_port }}"
+
+  tasks:
+    - name: Check vault init status
+      uri:
+        url: "{{ vault_addr }}/v1/sys/init"
+        method: GET
+      register: vault_init_status
+
+    - name: Initialize vault with 5 key shares, threshold 3
+      uri:
+        url: "{{ vault_addr }}/v1/sys/init"
+        method: PUT
+        body_format: json
+        body:
+          secret_shares: 5
+          secret_threshold: 3
+        status_code: 200
+      register: vault_init
+      when: not vault_init_status.json.initialized
+
+    - name: Save root token and unseal keys locally
+      copy:
+        content: |
+          Root Token: {{ vault_init.json.root_token }}
+          Unseal Key 1: {{ vault_init.json.keys[0] }}
+          Unseal Key 2: {{ vault_init.json.keys[1] }}
+          Unseal Key 3: {{ vault_init.json.keys[2] }}
+          Unseal Key 4: {{ vault_init.json.keys[3] }}
+          Unseal Key 5: {{ vault_init.json.keys[4] }}
+        dest: "{{ lookup('env','HOME') }}/vault-keys.txt"
+        mode: '0600'
+      delegate_to: localhost
+      when: vault_init is changed
+
+    - name: Read existing keys file if vault was already initialized
+      slurp:
+        src: "{{ lookup('env','HOME') }}/vault-keys.txt"
+      register: existing_keys_file
+      delegate_to: localhost
+      when: vault_init_status.json.initialized
+
+    - name: Build unseal key list from a freshly initialized vault
+      set_fact:
+        vault_unseal_keys: "{{ vault_init.json.keys[:3] }}"
+      when: vault_init is changed
+
+    - name: Build unseal key list from an existing keys file
+      set_fact:
+        vault_unseal_keys: "{{ (existing_keys_file.content | b64decode).splitlines() | select('match', '^Unseal Key [123]:') | map('regex_replace', '^Unseal Key [123]: ', '') | list }}"
+      when: vault_init_status.json.initialized and vault_unseal_keys is not defined
+
+    - name: Unseal vault using three keys
+      uri:
+        url: "{{ vault_addr }}/v1/sys/unseal"
+        method: PUT
+        body_format: json
+        body:
+          key: "{{ item }}"
+        status_code: 200
+      loop: "{{ vault_unseal_keys }}"
+
+    - name: Verify vault seal status
+      uri:
+        url: "{{ vault_addr }}/v1/sys/seal-status"
+        method: GET
+      register: vault_seal_status
+
+    - name: Display seal status
+      debug:
+        msg: "Vault sealed: {{ vault_seal_status.json.sealed }}"
+EOF
+
+cd ~/vault-ansible-lab
+ansible-playbook -i inventory/hosts playbooks/initialize-vault.yml
+Deliverable: ~/vault-keys.txt exists with a root token and five unseal keys, and the playbook's final debug message reads Vault sealed: False. Confirm with:
+
+cat ~/vault-keys.txt
+export VAULT_ADDR='http://127.0.0.1:8200'
+vault status
+vault status should show Sealed: false and Initialized: true.
+
+Subtask 2.2: Enable a Secrets Engine, Write Secrets, and Create Policies
+cat > ~/vault-ansible-lab/playbooks/manage-vault-data.yml << 'EOF'
+---
+- name: Enable secrets engine, write secrets, create policies
+  hosts: vault_servers
+  gather_facts: no
+  vars:
+    vault_addr: "http://{{ vault_address }}:{{ vault_port }}"
+    vault_token: "{{ lookup('file', lookup('env','HOME') + '/vault-keys.txt') | regex_search('Root Token: (\\S+)', '\\1') | first }}"
+
+  tasks:
+    - name: Enable KV version 2 secrets engine at secret/
+      uri:
+        url: "{{ vault_addr }}/v1/sys/mounts/secret"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ vault_token }}"
+        body_format: json
+        body:
+          type: "kv"
+          options:
+            version: "2"
+        status_code: [204, 400]
+
+    - name: Write a sample database secret
+      uri:
+        url: "{{ vault_addr }}/v1/secret/data/database"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ vault_token }}"
+        body_format: json
+        body:
+          data:
+            username: "dbadmin"
+            password: "lab-only-password-123"
+            host: "db.lab.local"
+            port: "5432"
+        status_code: 200
+
+    - name: Write a sample development secret
+      uri:
+        url: "{{ vault_addr }}/v1/secret/data/dev/app"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ vault_token }}"
+        body_format: json
+        body:
+          data:
+            debug_mode: "true"
+            log_level: "debug"
+        status_code: 200
+
+    - name: Create a developer policy limited to secret/data/dev/*
+      uri:
+        url: "{{ vault_addr }}/v1/sys/policies/acl/developer"
+        method: PUT
+        headers:
+          X-Vault-Token: "{{ vault_token }}"
+        body_format: json
+        body:
+          policy: |
+            path "secret/data/dev/*" {
+              capabilities = ["create", "read", "update", "delete", "list"]
+            }
+            path "secret/metadata/dev/*" {
+              capabilities = ["list", "read", "delete"]
+            }
+        status_code: 204
+
+    - name: List configured policies
+      uri:
+        url: "{{ vault_addr }}/v1/sys/policies/acl"
+        method: LIST
+        headers:
+          X-Vault-Token: "{{ vault_token }}"
+        status_code: 200
+      register: vault_policies
+
+    - name: Display policy names
+      debug:
+        msg: "Configured policies: {{ vault_policies.json.data.keys }}"
+EOF
+
+cd ~/vault-ansible-lab
+ansible-playbook -i inventory/hosts playbooks/manage-vault-data.yml
+Deliverable: the final debug task prints Configured policies: including default, root, and developer. Confirm manually:
+
+export VAULT_ADDR='http://127.0.0.1:8200'
+export VAULT_TOKEN=$(grep "Root Token:" ~/vault-keys.txt | awk '{print $3}')
+vault kv get secret/database
+vault policy read developer
+vault kv get secret/database should print the key-value pairs username, password, host, and port under a Data heading.
+
+Subtask 2.3: Automate Secret Retrieval into a Consuming Application File
+cat > ~/vault-ansible-lab/playbooks/retrieve-secrets.yml << 'EOF'
+---
+- name: Retrieve secrets and render an application config
+  hosts: vault_servers
+  gather_facts: no
+  vars:
+    vault_addr: "http://{{ vault_address }}:{{ vault_port }}"
+    vault_token: "{{ lookup('file', lookup('env','HOME') + '/vault-keys.txt') | regex_search('Root Token: (\\S+)', '\\1') | first }}"
+
+  tasks:
+    - name: Read database secret
+      uri:
+        url: "{{ vault_addr }}/v1/secret/data/database"
+        method: GET
+        headers:
+          X-Vault-Token: "{{ vault_token }}"
+        status_code: 200
+      register: db_secret
+
+    - name: Render application configuration file with retrieved secret values
+      copy:
+        content: |
+          # Generated by Ansible from Vault secret data - lab use only
+          [database]
+          host = {{ db_secret.json.data.data.host }}
+          port = {{ db_secret.json.data.data.port }}
+          username = {{ db_secret.json.data.data.username }}
+          password = {{ db_secret.json.data.data.password }}
+        dest: "{{ lookup('env','HOME') }}/app-config.ini"
+        mode: '0600'
+      delegate_to: localhost
+
+    - name: Confirm file was written
+      stat:
+        path: "{{ lookup('env','HOME') }}/app-config.ini"
+      delegate_to: localhost
+      register: config_stat
+
+    - name: Display confirmation
+      debug:
+        msg: "app-config.ini exists: {{ config_stat.stat.exists }}, size: {{ config_stat.stat.size }} bytes"
+EOF
+
+cd ~/vault-ansible-lab
+ansible-playbook -i inventory/hosts playbooks/retrieve-secrets.yml
+cat ~/app-config.ini
+Deliverable: ~/app-config.ini contains a [database] section populated with the values written into Vault in Subtask 2.2, proving that the secret was retrieved and rendered automatically rather than hardcoded.
+
+Task 3: Verify Policy Enforcement and Monitor Vault Health
+Subtask 3.1: Verify Policy Enforcement with a Scoped Token
+export VAULT_ADDR='http://127.0.0.1:8200'
+export VAULT_TOKEN=$(grep "Root Token:" ~/vault-keys.txt | awk '{print $3}')
+
+# Create a token restricted to the developer policy
+DEV_TOKEN=$(vault token create -policy="developer" -field=token)
+echo "Developer token: $DEV_TOKEN"
+
+# As the developer token, access to secret/dev/app should succeed
+VAULT_TOKEN=$DEV_TOKEN vault kv get secret/dev/app
+
+# As the developer token, access to secret/database should be denied
+VAULT_TOKEN=$DEV_TOKEN vault kv get secret/database
+Expected result: the first vault kv get secret/dev/app command succeeds and prints the debug_mode and log_level keys. The second command against secret/database fails with Error making API request and a 403 permission denied message, confirming the developer policy correctly restricts access outside secret/data/dev/*.
+
+Subtask 3.2: Performance and Monitoring Test
+Vault exposes a health endpoint and, once enabled, a Prometheus-format telemetry endpoint. In this subtask you check both to confirm the deployment is healthy and observable.
+
+# Check basic health and response time
+curl -s -o /dev/null -w "HTTP status: %{http_code}, response time: %{time_total}s\n" \
+  http://127.0.0.1:8200/v1/sys/health
+
+# Inspect full health JSON
+curl -s http://127.0.0.1:8200/v1/sys/health | jq
+Expected result: the health check returns HTTP status 200 (initialized, unsealed, active) with a response time well under one second, and the JSON body includes fields initialized: true, sealed: false, and standby: false.
+
+Enable telemetry so Vault exposes metrics, then confirm the metrics endpoint responds:
+
+export VAULT_TOKEN=$(grep "Root Token:" ~/vault-keys.txt | awk '{print $3}')
+
+# Vault must be configured with telemetry to expose /v1/sys/metrics; check the endpoint
+# using the root token (sys/metrics requires a token with sufficient permissions)
+curl -s -H "X-Vault-Token: $VAULT_TOKEN" \
+  http://127.0.0.1:8200/v1/sys/metrics?format=prometheus | head -n 20
+Expected result: the output begins with Prometheus-style comment lines such as # HELP and # TYPE, followed by metric lines (for example vault_core_unsealed), confirming Vault is exposing operational metrics that could be scraped by a monitoring system such as Prometheus.
+
+Finally, run a small repeated-request check to confirm the service stays responsive under light load:
+
+for i in 1 2 3 4 5; do
+  curl -s -o /dev/null -w "Request $i: HTTP %{http_code} in %{time_total}s\n" \
+    http://127.0.0.1:8200/v1/sys/health
+  sleep 1
+done
+Deliverable: five consecutive lines each showing HTTP 200 with response times consistently under one second, demonstrating that the Ansible-deployed Vault instance is stable and responsive.
+
+Expected Outcomes
+A running, unsealed HashiCorp Vault instance deployed entirely through Ansible playbooks and roles
+Working policies and secrets demonstrating least-privilege access control, verified with scoped tokens
+Confirmation that Vault's health and metrics endpoints report a healthy, responsive service
+Troubleshooting
+ansible-playbook fails with "vault: command not found" during the post_tasks status check: the vault binary may not be on the PATH used by the Ansible-managed shell environment. Check which vault and confirm the install step in Subtask 1.2 completed before rerunning the playbook.
+uri tasks against /v1/sys/init or /v1/sys/unseal return connection refused: Vault may still be starting up or the systemd service failed. Check sudo systemctl status vault --no-pager and sudo journalctl -u vault -n 50 for the actual startup error before re-running the playbook.
+Conclusion
+In this lab, you used Ansible to fully automate the deployment of HashiCorp Vault, from installing the binary and generating systemd unit and configuration files through initializing, unsealing, and populating Vault with secrets and access policies. You then verified that the developer policy correctly enforced least-privilege access using a scoped token, and confirmed the deployment's operational health by checking Vault's health endpoint, response times, and Prometheus-format metrics. This exercise demonstrated how configuration management tools like Ansible can make secret management infrastructure reproducible, auditable, and testable, which are core practices for defending sensitive credentials in real-world environments. As a next step, consider extending the playbooks to enable Vault's audit logging, integrate a dynamic secrets engine such as the database secrets engine, or automate periodic health checks with a monitoring tool that scrapes the metrics endpoint you validated in Task 3.
