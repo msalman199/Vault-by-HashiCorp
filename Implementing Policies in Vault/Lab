@@ -1,0 +1,621 @@
+Implementing Policies in Vault
+Lab Objectives
+By the end of this lab, students will be able to:
+
+Understand HashiCorp Vault policy concepts and structure
+Create and write access policies using HashiCorp Configuration Language (HCL)
+Apply policies to control access to secrets and paths in Vault
+Test and validate policy effectiveness through practical scenarios
+Manage policy lifecycle including updates and deletions
+Implement role-based access control using Vault policies
+Prerequisites
+Before starting this lab, students should have:
+
+Basic understanding of Linux command line operations
+Familiarity with text editors (nano, vim, or similar)
+Understanding of basic security concepts like authentication and authorization
+Knowledge of JSON and basic configuration file formats
+Completion of previous Vault labs or equivalent experience with Vault basics
+Lab Environment
+Al Nafi provides Linux-based cloud machines for this lab. Simply click Start Lab to access your dedicated environment. The provided Linux machine is bare metal with no pre-installed tools, so you will install HashiCorp Vault and other required tools during the lab exercises.
+
+Task 1: Environment Setup and Vault Installation
+Subtask 1.1: Update System and Install Prerequisites
+First, update your system and install necessary packages:
+
+# Update package lists
+sudo apt update
+
+# Install required packages
+sudo apt install -y curl unzip wget gpg software-properties-common
+
+# Verify installations
+curl --version
+unzip -v
+Subtask 1.2: Install HashiCorp Vault
+Download and install the latest version of HashiCorp Vault:
+
+# Add HashiCorp GPG key
+curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo apt-key add -
+
+# Add HashiCorp repository
+sudo apt-add-repository "deb [arch=amd64] https://apt.releases.hashicorp.com $(lsb_release -cs) main"
+
+# Update package lists
+sudo apt update
+
+# Install Vault
+sudo apt install vault
+
+# Verify installation
+vault version
+Subtask 1.3: Start Vault Development Server
+Start Vault in development mode for this lab:
+
+# Start Vault dev server (this will run in foreground)
+vault server -dev -dev-root-token-id="root-token" -dev-listen-address="0.0.0.0:8200"
+Open a new terminal session and set environment variables:
+
+# Set Vault address
+export VAULT_ADDR='http://127.0.0.1:8200'
+
+# Set root token
+export VAULT_TOKEN="root-token"
+
+# Verify connection
+vault status
+Task 2: Understanding Vault Policy Structure
+Subtask 2.1: Examine Default Policies
+List and examine existing policies in Vault:
+
+# List all policies
+vault policy list
+
+# Read the default policy
+vault policy read default
+
+# Read the root policy
+vault policy read root
+Subtask 2.2: Create Lab Directory Structure
+Create a working directory for policy files:
+
+# Create lab directory
+mkdir -p ~/vault-policies-lab
+cd ~/vault-policies-lab
+
+# Create subdirectories for organization
+mkdir policies
+mkdir test-data
+Task 3: Creating Basic Policies in HCL
+Subtask 3.1: Create a Read-Only Policy
+Create your first policy for read-only access to specific paths:
+
+# Create read-only policy file
+cat > policies/readonly-policy.hcl << 'EOF'
+# Read-only policy for application secrets
+path "secret/data/app/*" {
+  capabilities = ["read", "list"]
+}
+
+# Allow listing of secret engines
+path "secret/metadata" {
+  capabilities = ["list"]
+}
+
+# Allow reading own token information
+path "auth/token/lookup-self" {
+  capabilities = ["read"]
+}
+
+# Allow token renewal
+path "auth/token/renew-self" {
+  capabilities = ["update"]
+}
+EOF
+Subtask 3.2: Create a Developer Policy
+Create a policy for developers with broader access:
+
+# Create developer policy file
+cat > policies/developer-policy.hcl << 'EOF'
+# Developer policy with read/write access to development secrets
+path "secret/data/dev/*" {
+  capabilities = ["create", "read", "update", "delete", "list"]
+}
+
+# Read access to shared configuration
+path "secret/data/shared/config" {
+  capabilities = ["read"]
+}
+
+# List capabilities for secret metadata
+path "secret/metadata/dev/*" {
+  capabilities = ["list"]
+}
+
+# Allow developers to manage their own tokens
+path "auth/token/lookup-self" {
+  capabilities = ["read"]
+}
+
+path "auth/token/renew-self" {
+  capabilities = ["update"]
+}
+
+path "auth/token/revoke-self" {
+  capabilities = ["update"]
+}
+EOF
+Subtask 3.3: Create an Admin Policy
+Create a comprehensive admin policy:
+
+# Create admin policy file
+cat > policies/admin-policy.hcl << 'EOF'
+# Admin policy with broad access
+path "secret/*" {
+  capabilities = ["create", "read", "update", "delete", "list"]
+}
+
+# Manage auth methods
+path "auth/*" {
+  capabilities = ["create", "read", "update", "delete", "list", "sudo"]
+}
+
+# Manage policies
+path "sys/policies/acl/*" {
+  capabilities = ["create", "read", "update", "delete", "list"]
+}
+
+# System configuration
+path "sys/config/*" {
+  capabilities = ["read", "update"]
+}
+
+# Audit logs
+path "sys/audit" {
+  capabilities = ["read", "list"]
+}
+
+# Health and status
+path "sys/health" {
+  capabilities = ["read"]
+}
+
+# Manage tokens
+path "auth/token/*" {
+  capabilities = ["create", "read", "update", "delete", "list", "sudo"]
+}
+EOF
+Task 4: Applying Policies to Control Access
+Subtask 4.1: Load Policies into Vault
+Apply the created policies to Vault:
+
+# Load the read-only policy
+vault policy write readonly-policy policies/readonly-policy.hcl
+
+# Load the developer policy
+vault policy write developer-policy policies/developer-policy.hcl
+
+# Load the admin policy
+vault policy write admin-policy policies/admin-policy.hcl
+
+# Verify policies are loaded
+vault policy list
+Subtask 4.2: Create Test Data
+Create some test secrets to work with:
+
+# Enable KV v2 secrets engine if not already enabled
+vault secrets enable -path=secret kv-v2
+
+# Create test secrets for different paths
+vault kv put secret/app/database username="app_user" password="app_pass123"
+vault kv put secret/app/api-key key="api_key_12345" environment="production"
+
+vault kv put secret/dev/database username="dev_user" password="dev_pass456"
+vault kv put secret/dev/api-key key="dev_api_key_67890" environment="development"
+
+vault kv put secret/shared/config timeout="30s" max_connections="100"
+
+# Verify secrets are created
+vault kv list secret/
+Subtask 4.3: Create Tokens with Different Policies
+Create tokens associated with different policies:
+
+# Create a read-only token
+READONLY_TOKEN=$(vault token create -policy="readonly-policy" -format=json | jq -r '.auth.client_token')
+echo "Read-only token: $READONLY_TOKEN"
+
+# Create a developer token
+DEVELOPER_TOKEN=$(vault token create -policy="developer-policy" -format=json | jq -r '.auth.client_token')
+echo "Developer token: $DEVELOPER_TOKEN"
+
+# Create an admin token
+ADMIN_TOKEN=$(vault token create -policy="admin-policy" -format=json | jq -r '.auth.client_token')
+echo "Admin token: $ADMIN_TOKEN"
+
+# Save tokens to file for reference
+echo "READONLY_TOKEN=$READONLY_TOKEN" > test-data/tokens.env
+echo "DEVELOPER_TOKEN=$DEVELOPER_TOKEN" >> test-data/tokens.env
+echo "ADMIN_TOKEN=$ADMIN_TOKEN" >> test-data/tokens.env
+Task 5: Testing Policy Effectiveness
+Subtask 5.1: Test Read-Only Policy
+Test the read-only policy limitations:
+
+# Switch to read-only token
+export VAULT_TOKEN=$READONLY_TOKEN
+
+# Test successful read operations
+echo "Testing read-only policy - should succeed:"
+vault kv get secret/app/database
+vault kv list secret/app
+
+# Test failed write operations
+echo "Testing read-only policy - should fail:"
+vault kv put secret/app/test key="value" || echo "Write operation denied as expected"
+
+# Test access to unauthorized paths
+echo "Testing unauthorized path access - should fail:"
+vault kv get secret/dev/database || echo "Access denied as expected"
+Subtask 5.2: Test Developer Policy
+Test the developer policy capabilities:
+
+# Switch to developer token
+export VAULT_TOKEN=$DEVELOPER_TOKEN
+
+# Test successful operations
+echo "Testing developer policy - should succeed:"
+vault kv get secret/dev/database
+vault kv put secret/dev/test-key value="test123"
+vault kv get secret/shared/config
+
+# Test restricted operations
+echo "Testing restricted operations - should fail:"
+vault kv put secret/app/test key="value" || echo "Write to app path denied as expected"
+vault kv delete secret/shared/config || echo "Delete shared config denied as expected"
+Subtask 5.3: Test Admin Policy
+Test the admin policy capabilities:
+
+# Switch to admin token
+export VAULT_TOKEN=$ADMIN_TOKEN
+
+# Test broad access
+echo "Testing admin policy - should succeed:"
+vault kv get secret/app/database
+vault kv get secret/dev/database
+vault kv put secret/admin/test admin="true"
+
+# Test policy management
+vault policy read readonly-policy
+vault policy list
+
+# Test token management
+vault token lookup $READONLY_TOKEN
+Task 6: Advanced Policy Features
+Subtask 6.1: Create Policy with Path Templating
+Create a policy using templating for user-specific paths:
+
+# Create user-specific policy
+cat > policies/user-specific-policy.hcl << 'EOF'
+# Allow users to access their own secrets
+path "secret/data/users/{{identity.entity.name}}/*" {
+  capabilities = ["create", "read", "update", "delete", "list"]
+}
+
+# Allow users to list their own path
+path "secret/metadata/users/{{identity.entity.name}}" {
+  capabilities = ["list"]
+}
+
+# Standard token operations
+path "auth/token/lookup-self" {
+  capabilities = ["read"]
+}
+
+path "auth/token/renew-self" {
+  capabilities = ["update"]
+}
+EOF
+
+# Load the templated policy
+vault policy write user-specific-policy policies/user-specific-policy.hcl
+Subtask 6.2: Create Policy with Conditions
+Create a policy with conditional access:
+
+# Create conditional policy
+cat > policies/conditional-policy.hcl << 'EOF'
+# Time-based access (example - requires Vault Enterprise for full functionality)
+path "secret/data/time-sensitive/*" {
+  capabilities = ["read"]
+  # This is a basic example - advanced conditions require Vault Enterprise
+}
+
+# IP-based restrictions (basic example)
+path "secret/data/restricted/*" {
+  capabilities = ["read", "list"]
+  # Note: Advanced IP restrictions require Vault Enterprise
+}
+
+# Standard capabilities
+path "auth/token/lookup-self" {
+  capabilities = ["read"]
+}
+EOF
+
+# Load the conditional policy
+vault policy write conditional-policy policies/conditional-policy.hcl
+Subtask 6.3: Create Policy with Deny Rules
+Create a policy that explicitly denies certain operations:
+
+# Create policy with deny rules
+cat > policies/deny-example-policy.hcl << 'EOF'
+# Allow broad read access
+path "secret/data/*" {
+  capabilities = ["read", "list"]
+}
+
+# Explicitly deny access to sensitive paths
+path "secret/data/sensitive/*" {
+  capabilities = ["deny"]
+}
+
+# Allow most operations on user data but deny delete
+path "secret/data/user-data/*" {
+  capabilities = ["create", "read", "update", "list"]
+}
+
+path "secret/data/user-data/*" {
+  capabilities = ["deny"]
+  denied_parameters = {
+    "delete" = []
+  }
+}
+EOF
+
+# Load the deny policy
+vault policy write deny-example-policy policies/deny-example-policy.hcl
+Task 7: Policy Management and Maintenance
+Subtask 7.1: Update Existing Policies
+Practice updating policies:
+
+# Switch back to root token for admin operations
+export VAULT_TOKEN="root-token"
+
+# Update the developer policy to add new permissions
+cat > policies/developer-policy-updated.hcl << 'EOF'
+# Updated developer policy with additional permissions
+path "secret/data/dev/*" {
+  capabilities = ["create", "read", "update", "delete", "list"]
+}
+
+# New: Allow access to staging environment
+path "secret/data/staging/*" {
+  capabilities = ["read", "list"]
+}
+
+# Read access to shared configuration
+path "secret/data/shared/config" {
+  capabilities = ["read"]
+}
+
+# List capabilities for secret metadata
+path "secret/metadata/dev/*" {
+  capabilities = ["list"]
+}
+
+path "secret/metadata/staging/*" {
+  capabilities = ["list"]
+}
+
+# Token management
+path "auth/token/lookup-self" {
+  capabilities = ["read"]
+}
+
+path "auth/token/renew-self" {
+  capabilities = ["update"]
+}
+
+path "auth/token/revoke-self" {
+  capabilities = ["update"]
+}
+EOF
+
+# Update the policy
+vault policy write developer-policy policies/developer-policy-updated.hcl
+
+# Verify the update
+vault policy read developer-policy
+Subtask 7.2: Policy Validation and Testing
+Create a comprehensive test script:
+
+# Create policy test script
+cat > test-data/policy-test.sh << 'EOF'
+#!/bin/bash
+
+# Policy testing script
+echo "=== Vault Policy Testing Script ==="
+
+# Source token file
+source test-data/tokens.env
+
+# Test function
+test_operation() {
+    local token=$1
+    local operation=$2
+    local expected=$3
+    
+    export VAULT_TOKEN=$token
+    echo "Testing: $operation"
+    
+    if eval "$operation" >/dev/null 2>&1; then
+        if [ "$expected" = "success" ]; then
+            echo "✓ PASS: Operation succeeded as expected"
+        else
+            echo "✗ FAIL: Operation succeeded but should have failed"
+        fi
+    else
+        if [ "$expected" = "fail" ]; then
+            echo "✓ PASS: Operation failed as expected"
+        else
+            echo "✗ FAIL: Operation failed but should have succeeded"
+        fi
+    fi
+    echo ""
+}
+
+# Test readonly policy
+echo "=== Testing Read-Only Policy ==="
+test_operation "$READONLY_TOKEN" "vault kv get secret/app/database" "success"
+test_operation "$READONLY_TOKEN" "vault kv put secret/app/test key=value" "fail"
+
+# Test developer policy
+echo "=== Testing Developer Policy ==="
+test_operation "$DEVELOPER_TOKEN" "vault kv get secret/dev/database" "success"
+test_operation "$DEVELOPER_TOKEN" "vault kv put secret/dev/test key=value" "success"
+test_operation "$DEVELOPER_TOKEN" "vault kv get secret/app/database" "fail"
+
+echo "=== Policy Testing Complete ==="
+EOF
+
+# Make script executable and run it
+chmod +x test-data/policy-test.sh
+./test-data/policy-test.sh
+Subtask 7.3: Policy Documentation
+Create documentation for your policies:
+
+# Create policy documentation
+cat > policies/README.md << 'EOF'
+# Vault Policies Documentation
+
+## Policy Overview
+
+This directory contains HashiCorp Vault policies for access control management.
+
+### Available Policies
+
+#### readonly-policy
+- **Purpose**: Provides read-only access to application secrets
+- **Paths**: `secret/data/app/*`
+- **Capabilities**: read, list
+- **Use Case**: Production applications that only need to read secrets
+
+#### developer-policy
+- **Purpose**: Provides development team access to development secrets
+- **Paths**: `secret/data/dev/*`, `secret/data/staging/*` (read-only)
+- **Capabilities**: Full CRUD on dev paths, read on staging
+- **Use Case**: Development team members
+
+#### admin-policy
+- **Purpose**: Administrative access for Vault management
+- **Paths**: `secret/*`, `auth/*`, `sys/policies/*`
+- **Capabilities**: Full administrative access
+- **Use Case**: Vault administrators and DevOps team
+
+### Policy Best Practices
+
+1. **Principle of Least Privilege**: Grant minimum necessary permissions
+2. **Path Specificity**: Use specific paths rather than wildcards when possible
+3. **Regular Review**: Periodically review and update policies
+4. **Testing**: Always test policies before applying to production
+5. **Documentation**: Keep policies well-documented and version controlled
+
+### Usage Examples
+
+```bash
+# Apply a policy
+vault policy write policy-name policy-file.hcl
+
+# Create token with policy
+vault token create -policy="policy-name"
+
+# Test policy
+export VAULT_TOKEN="token-here"
+vault kv get secret/path/to/test
+EOF
+
+echo "Policy documentation created at policies/README.md"
+
+
+## Task 8: Cleanup and Policy Removal
+
+### Subtask 8.1: Revoke Test Tokens
+
+Clean up the tokens created during testing:
+
+```bash
+# Switch back to root token
+export VAULT_TOKEN="root-token"
+
+# Source tokens for cleanup
+source test-data/tokens.env
+
+# Revoke all test tokens
+vault token revoke $READONLY_TOKEN
+vault token revoke $DEVELOPER_TOKEN  
+vault token revoke $ADMIN_TOKEN
+
+echo "All test tokens have been revoked"
+Subtask 8.2: Remove Test Policies (Optional)
+If desired, remove the test policies:
+
+# List current policies
+vault policy list
+
+# Remove test policies (uncomment if you want to clean up)
+# vault policy delete user-specific-policy
+# vault policy delete conditional-policy
+# vault policy delete deny-example-policy
+
+echo "Cleanup completed"
+Troubleshooting Tips
+Common Issues and Solutions
+Issue: Policy not taking effect immediately
+
+Solution: Tokens cache policy information. Create a new token or wait for token renewal.
+Issue: "Permission denied" errors when testing
+
+Solution: Verify you're using the correct token and that the policy paths match exactly.
+Issue: Policy syntax errors
+
+Solution: Use vault policy fmt policy-file.hcl to format and validate syntax.
+Issue: Cannot access secrets after applying policy
+
+Solution: Check that the policy includes necessary capabilities and the correct path format.
+Validation Commands
+# Validate policy syntax
+vault policy fmt policies/policy-name.hcl
+
+# Check current token capabilities
+vault token capabilities secret/data/path
+
+# Lookup token information
+vault token lookup
+
+# Test specific path access
+vault kv get secret/data/test/path
+Conclusion
+In this lab, you have successfully:
+
+Installed and configured HashiCorp Vault on a Linux system
+Created comprehensive access policies using HashiCorp Configuration Language (HCL)
+Implemented role-based access control through different policy types (read-only, developer, admin)
+Applied policies to control access to secrets and Vault operations
+Tested policy effectiveness through practical scenarios and validation
+Explored advanced policy features including templating and conditional access
+Managed policy lifecycle including updates, testing, and documentation
+Key Takeaways
+Policy-Based Security: Vault policies provide fine-grained access control that follows the principle of least privilege, ensuring users and applications only have access to the resources they need.
+
+HCL Flexibility: HashiCorp Configuration Language offers powerful features for creating dynamic, maintainable policies that can scale with your organization's needs.
+
+Testing Importance: Thorough testing of policies before production deployment is crucial for maintaining security while ensuring legitimate access remains functional.
+
+Documentation Value: Well-documented policies improve team collaboration, compliance, and long-term maintenance of your Vault infrastructure.
+
+Real-World Applications
+The skills learned in this lab directly apply to:
+
+Enterprise Secret Management: Implementing secure access controls for applications and services
+DevOps Workflows: Creating policies that support CI/CD pipelines while maintaining security
+Compliance Requirements: Meeting regulatory standards through documented access controls
+Multi-Team Environments: Managing access across different teams and environments safely
+Understanding Vault policies is essential for anyone working with HashiCorp Vault in production environments, as they form the foundation of Vault's security model and enable organizations to implement robust, scalable secret management solutions.
