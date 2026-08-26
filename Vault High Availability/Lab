@@ -1,0 +1,307 @@
+Vault High Availability with Consul Storage Backend
+Objectives
+By the end of this lab, you will be able to:
+
+Configure a multi-node HashiCorp Vault cluster for high availability using Consul as the storage backend
+Initialize and unseal Vault nodes and verify cluster membership
+Test failover behavior by stopping and restarting a cluster node and confirm the cluster continues to serve reads and writes
+Build a monitoring script that checks service status, port connectivity, and Vault node health
+Diagnose and resolve common Vault/Consul HA configuration problems
+Prerequisites
+Before starting this lab, you should have:
+
+Basic understanding of Linux command line operations
+Familiarity with HashiCorp Vault fundamentals (seal/unseal, secrets engines, tokens)
+Basic knowledge of systemd services and JSON/HCL configuration files
+A single Linux VM (Ubuntu 20.04+ or Debian-based) with sudo access, used only for this isolated practice environment
+Install all required tools before starting:
+
+sudo apt update
+sudo apt install -y wget curl unzip jq netcat-openbsd
+
+mkdir -p ~/vault-ha-lab
+cd ~/vault-ha-lab
+Install Vault and Consul (this uses the HashiCorp apt repository so you always get a current, compatible release of both tools):
+
+wget -O- https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+
+echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | \
+  sudo tee /etc/apt/sources.list.d/hashicorp.list
+
+sudo apt update
+sudo apt install -y vault consul
+
+vault version
+consul version
+Expected output: both commands print a version string (for example Vault v1.15.x) with no errors. If either command is not found, re-run the apt install step before continuing.
+
+Task 1: Configure Consul as the Vault Storage Backend
+Step 1.1: Create system users and directories
+sudo useradd --system --home /etc/vault.d --shell /bin/false vault 2>/dev/null || true
+sudo useradd --system --home /etc/consul.d --shell /bin/false consul 2>/dev/null || true
+
+sudo mkdir -p /opt/vault/data /opt/consul/data /etc/vault.d /etc/consul.d
+
+sudo chown -R vault:vault /opt/vault /etc/vault.d
+sudo chown -R consul:consul /opt/consul /etc/consul.d
+Step 1.2: Configure and start a single-node Consul agent
+sudo tee /etc/consul.d/consul.hcl > /dev/null <<'EOF'
+datacenter = "dc1"
+data_dir = "/opt/consul/data"
+log_level = "INFO"
+node_name = "consul-node-1"
+bind_addr = "127.0.0.1"
+client_addr = "127.0.0.1"
+server = true
+bootstrap_expect = 1
+ui_config {
+  enabled = true
+}
+EOF
+
+sudo chown consul:consul /etc/consul.d/consul.hcl
+
+sudo tee /etc/systemd/system/consul.service > /dev/null <<'EOF'
+[Unit]
+Description=Consul
+Documentation=https://www.consul.io/
+Requires=network-online.target
+After=network-online.target
+ConditionFileNotEmpty=/etc/consul.d/consul.hcl
+
+[Service]
+Type=notify
+User=consul
+Group=consul
+ExecStart=/usr/bin/consul agent -config-dir=/etc/consul.d/
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=process
+Restart=on-failure
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now consul
+sudo systemctl status consul --no-pager
+consul members
+Expected output: consul members prints a table with one row, consul-node-1, Status = alive. If the row is missing, see Troubleshooting Issue 1.
+
+Step 1.3: Configure three Vault nodes sharing the Consul backend
+for i in 1 2 3; do
+  port_api=$((8200 + (i-1)*10))
+  port_cluster=$((8201 + (i-1)*10))
+  sudo tee /etc/vault.d/vault-node${i}.hcl > /dev/null <<EOF
+storage "consul" {
+  address = "127.0.0.1:8500"
+  path    = "vault-node${i}/"
+}
+
+listener "tcp" {
+  address     = "127.0.0.1:${port_api}"
+  tls_disable = 1
+}
+
+api_addr     = "http://127.0.0.1:${port_api}"
+cluster_addr = "http://127.0.0.1:${port_cluster}"
+ui = true
+disable_mlock = true
+cluster_name = "vault-ha-cluster"
+EOF
+done
+
+sudo chown -R vault:vault /etc/vault.d
+ls -la /etc/vault.d/
+Note: each node uses a distinct Consul storage path (vault-node1/, vault-node2/, vault-node3/) because this is a single-machine simulation of HA on one Consul agent. In a real deployment, all Vault nodes share one Consul cluster and the same storage path (vault/) since Consul itself provides the distributed backend. Here each Vault node is deliberately isolated so you can practice initialization, unsealing, and service management for multiple nodes without them racing to claim the same storage path.
+
+Deliverable: three files exist under /etc/vault.d/ (vault-node1.hcl, vault-node2.hcl, vault-node3.hcl), each with a unique listener port and cluster_addr, all owned by vault:vault.
+
+Task 2: Start, Initialize, and Unseal the Vault Nodes
+Step 2.1: Create systemd services and start all nodes
+for i in 1 2 3; do
+sudo tee /etc/systemd/system/vault-node${i}.service > /dev/null <<EOF
+[Unit]
+Description=Vault Node ${i}
+Documentation=https://developer.hashicorp.com/vault/docs
+Requires=network-online.target
+After=network-online.target consul.service
+ConditionFileNotEmpty=/etc/vault.d/vault-node${i}.hcl
+
+[Service]
+Type=notify
+User=vault
+Group=vault
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+AmbientCapabilities=CAP_IPC_LOCK
+NoNewPrivileges=yes
+ExecStart=/usr/bin/vault server -config=/etc/vault.d/vault-node${i}.hcl
+ExecReload=/bin/kill --signal HUP \$MAINPID
+KillMode=process
+KillSignal=SIGINT
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target
+EOF
+done
+
+sudo systemctl daemon-reload
+sudo systemctl enable vault-node1 vault-node2 vault-node3
+sudo systemctl start vault-node1
+sleep 3
+sudo systemctl start vault-node2
+sleep 3
+sudo systemctl start vault-node3
+sleep 3
+
+sudo systemctl is-active vault-node1 vault-node2 vault-node3
+Expected output: active printed three times. If any node shows failed, run sudo journalctl -u vault-node<N> --no-pager -n 30 and check for a port-already-in-use or config-parse error.
+
+Step 2.2: Initialize and unseal each node independently
+Because each node uses its own storage path, each node is its own independent single-server Vault instance for this lab. Initialize and unseal each one:
+
+mkdir -p ~/vault-ha-lab/init
+
+for i in 1 2 3; do
+  port=$((8200 + (i-1)*10))
+  export VAULT_ADDR="http://127.0.0.1:${port}"
+  vault operator init -key-shares=3 -key-threshold=2 -format=json > ~/vault-ha-lab/init/node${i}-init.json
+  echo "Node ${i} initialized on port ${port}"
+done
+
+cat ~/vault-ha-lab/init/node1-init.json | jq '.unseal_keys_b64, .root_token'
+Expected output: a JSON file per node containing unseal_keys_b64 (an array of 3 base64 strings) and root_token. If vault operator init returns error initializing vault: Vault is already initialized, the node already has data in Consul from a previous run; either reuse the existing keys or clear the Consul KV path (consul kv delete -recurse vault-node<N>/) and retry.
+
+for i in 1 2 3; do
+  port=$((8200 + (i-1)*10))
+  export VAULT_ADDR="http://127.0.0.1:${port}"
+  KEY1=$(jq -r '.unseal_keys_b64[0]' ~/vault-ha-lab/init/node${i}-init.json)
+  KEY2=$(jq -r '.unseal_keys_b64[1]' ~/vault-ha-lab/init/node${i}-init.json)
+  vault operator unseal "$KEY1" > /dev/null
+  vault operator unseal "$KEY2" > /dev/null
+  echo "Node ${i} unseal status:"
+  vault status -format=json | jq '{sealed, initialized}'
+done
+Expected output: for every node, "sealed": false and "initialized": true.
+
+Deliverable: three JSON init files under ~/vault-ha-lab/init/, and vault status -format=json on all three ports shows "sealed": false.
+
+Step 2.3: Store test data and verify from each node
+export VAULT_ADDR='http://127.0.0.1:8200'
+ROOT1=$(jq -r '.root_token' ~/vault-ha-lab/init/node1-init.json)
+vault login -no-print "$ROOT1"
+vault secrets enable -path=secret kv-v2
+vault kv put secret/app1 username="admin" password="secret123"
+vault kv get -format=json secret/app1 | jq '.data.data'
+Expected output: a JSON object {"password": "secret123", "username": "admin"}.
+
+Task 3: Build a Monitoring Script and Test Failover
+Step 3.1: Write a status and connectivity monitoring script
+tee ~/vault-ha-lab/vault-ha-monitor.sh > /dev/null <<'EOF'
+#!/bin/bash
+echo "Vault HA Cluster Monitoring Report"
+echo "==================================="
+echo "Timestamp: $(date)"
+echo ""
+
+echo "System Services Status:"
+echo "------------------------"
+for svc in consul vault-node1 vault-node2 vault-node3; do
+    echo "$svc: $(sudo systemctl is-active $svc)"
+done
+echo ""
+
+echo "Consul Cluster Members:"
+echo "------------------------"
+consul members
+echo ""
+
+echo "Vault Node Status:"
+echo "------------------"
+for i in 1 2 3; do
+    port=$((8200 + (i-1)*10))
+    echo "Node $i (127.0.0.1:$port):"
+    export VAULT_ADDR="http://127.0.0.1:$port"
+    if status_json=$(vault status -format=json 2>/dev/null); then
+        sealed=$(echo "$status_json" | jq -r '.sealed')
+        initialized=$(echo "$status_json" | jq -r '.initialized')
+        version=$(echo "$status_json" | jq -r '.version')
+        echo "  Initialized: $initialized"
+        echo "  Sealed: $sealed"
+        echo "  Version: $version"
+    else
+        echo "  Status: UNREACHABLE or SEALED"
+    fi
+    echo ""
+done
+
+echo "Port Connectivity:"
+echo "------------------"
+for port in 8200 8210 8220 8500; do
+    if timeout 1 bash -c "</dev/tcp/127.0.0.1/$port" 2>/dev/null; then
+        echo "  Port $port: OPEN"
+    else
+        echo "  Port $port: CLOSED"
+    fi
+done
+EOF
+
+chmod +x ~/vault-ha-lab/vault-ha-monitor.sh
+~/vault-ha-lab/vault-ha-monitor.sh
+Expected output: all four services show active, consul members shows one alive member, all three Vault nodes show Initialized: true / Sealed: false, and ports 8200, 8210, 8220, 8500 all report OPEN.
+
+Deliverable: the script runs without error and produces a full report matching the expected output above.
+
+Step 3.2: Simulate a node failure and verify the remaining nodes still serve data
+echo "Stopping Node 1..."
+sudo systemctl stop vault-node1
+sleep 3
+
+~/vault-ha-lab/vault-ha-monitor.sh
+
+export VAULT_ADDR='http://127.0.0.1:8210'
+ROOT2=$(jq -r '.root_token' ~/vault-ha-lab/init/node2-init.json)
+vault login -no-print "$ROOT2"
+vault secrets enable -path=secret kv-v2
+vault kv put secret/failover-test note="written while node1 is down"
+vault kv get -format=json secret/failover-test | jq '.data.data'
+Expected output: the monitor script shows vault-node1: inactive and port 8200 as CLOSED, while node 2 accepts the login and successfully writes and reads secret/failover-test. This confirms that node 2 is an independent, functioning Vault server even while node 1 is down (in a true multi-server Raft or Consul-shared-backend cluster, this is the same principle by which standby nodes keep serving after a leader failure).
+
+Step 3.3: Restore the failed node
+sudo systemctl start vault-node1
+sleep 3
+
+export VAULT_ADDR='http://127.0.0.1:8200'
+KEY1=$(jq -r '.unseal_keys_b64[0]' ~/vault-ha-lab/init/node1-init.json)
+KEY2=$(jq -r '.unseal_keys_b64[1]' ~/vault-ha-lab/init/node1-init.json)
+vault operator unseal "$KEY1" > /dev/null
+vault operator unseal "$KEY2" > /dev/null
+vault status -format=json | jq '{sealed, initialized}'
+
+~/vault-ha-lab/vault-ha-monitor.sh
+Expected output: node 1 shows "sealed": false again, and the final monitor report shows all four services active, all three Vault nodes unsealed, and all four ports OPEN.
+
+Deliverable: a screenshot or saved copy of the monitor script output before the failure, during the failure, and after recovery, showing the state transition described above.
+
+Expected Outcomes
+A running Consul agent and three independently initialized, unsealed Vault server processes, each backed by Consul storage
+A working monitoring script that reports service status, Vault seal/init state, and TCP port reachability using only bash built-ins and standard CLI tools
+Direct, hands-on evidence that stopping one Vault node does not prevent other nodes from serving reads and writes, and that a stopped node can rejoin cleanly after being unsealed again
+Troubleshooting Common Issues
+Issue 1: consul members prints nothing or the command hangs. Symptom: an empty table or a timeout instead of a row for consul-node-1. Diagnostic hint: run sudo systemctl status consul --no-pager and sudo journalctl -u consul --no-pager -n 30 and look for a bind address or permission error. If the service is not active (running), restart it with sudo systemctl restart consul and re-check consul members after a few seconds.
+
+Issue 2: A Vault node returns connection refused on its API port. Symptom: vault status for a given VAULT_ADDR errors with connection refused instead of returning JSON. Diagnostic hint: confirm the node's systemd unit is active with sudo systemctl is-active vault-node<N>, and confirm the port is open with timeout 1 bash -c "</dev/tcp/127.0.0.1/<port>" && echo OPEN || echo CLOSED. If the service is active but the port is closed, check the corresponding /etc/vault.d/vault-node<N>.hcl for a typo in the listener address, then run sudo systemctl restart vault-node<N>.
+
+Issue 3: Performance looks slow or resource usage seems high during monitoring. Symptom: the monitor script runs slowly or you notice heavy load while checking node status. Diagnostic hint: run top -bn1 | head -15 and free -h. Under normal load for this single-machine lab, CPU usage should stay under 30%, each Vault or Consul process should use well under 500 MB of memory, and disk activity should be minimal (iostat -x 1 3 if installed). Sustained high CPU or heavy disk I/O usually points to a crash-restart loop in a systemd unit rather than genuine load; check sudo journalctl -u vault-node<N> --no-pager -n 50 for repeated restarts.
+
+Conclusion
+In this lab you configured Consul as a storage backend, brought up three separate Vault server processes under systemd, and walked each one through initialization and unsealing. You then built a monitoring script from scratch using only jq, systemctl, and bash's built-in /dev/tcp mechanism to check service health and port reachability without relying on tools that may not be preinstalled. Finally, you simulated a node outage, confirmed that the remaining node kept serving reads and writes, and safely restored the failed node to a healthy, unsealed state. These exercises reflect the core operational skills behind real Vault HA deployments: verifying storage backend health, tracking seal status across nodes, and validating that the cluster tolerates individual node failures. For a production deployment, the next steps would be running Vault's integrated Raft storage or a true multi-server Consul cluster across separate hosts, enabling TLS on all listeners, and automating unsealing with a auto-unseal mechanism such as a cloud KMS instead of manually supplied key shares.
