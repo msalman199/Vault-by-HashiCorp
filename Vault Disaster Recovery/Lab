@@ -1,0 +1,780 @@
+Vault Disaster Recovery
+Lab Objectives
+By the end of this lab, you will be able to:
+
+Understand the importance of disaster recovery planning for HashiCorp Vault
+Implement backup strategies for Vault data and configuration
+Perform complete Vault data restoration from backups
+Verify data consistency and integrity after restoration
+Configure automated backup procedures for production environments
+Troubleshoot common disaster recovery scenarios
+Prerequisites
+Before starting this lab, you should have:
+
+Basic understanding of Linux command line operations
+Familiarity with file system navigation and permissions
+Basic knowledge of HashiCorp Vault concepts (secrets, policies, authentication)
+Understanding of JSON format and data structures
+Experience with text editors like nano or vim
+Lab Environment
+Al Nafi provides Linux-based cloud machines for this lab. Simply click Start Lab to access your dedicated environment. The provided Linux machine is bare metal with no pre-installed tools, so you will install all required components during the lab exercises.
+
+All tasks in this lab will be performed on a single Linux machine. No additional virtual machines or remote hosts are required.
+
+Task 1: Backup Vault Data
+Subtask 1.1: Install and Configure HashiCorp Vault
+First, we need to install Vault and set up a basic configuration with sample data.
+
+Step 1: Update the system and install required packages
+
+sudo apt update
+sudo apt install -y wget unzip curl jq
+Step 2: Download and install HashiCorp Vault
+
+# Download Vault binary
+wget https://releases.hashicorp.com/vault/1.15.2/vault_1.15.2_linux_amd64.zip
+
+# Unzip the binary
+unzip vault_1.15.2_linux_amd64.zip
+
+# Move to system path
+sudo mv vault /usr/local/bin/
+
+# Verify installation
+vault version
+Step 3: Create Vault configuration directory and files
+
+# Create Vault directory structure
+sudo mkdir -p /opt/vault/data
+sudo mkdir -p /opt/vault/config
+sudo mkdir -p /opt/vault/logs
+sudo mkdir -p /opt/vault/backups
+
+# Create Vault configuration file
+sudo tee /opt/vault/config/vault.hcl > /dev/null <<EOF
+storage "file" {
+  path = "/opt/vault/data"
+}
+
+listener "tcp" {
+  address     = "127.0.0.1:8200"
+  tls_disable = 1
+}
+
+api_addr = "http://127.0.0.1:8200"
+cluster_addr = "https://127.0.0.1:8201"
+ui = true
+disable_mlock = true
+EOF
+
+# Set proper permissions
+sudo chown -R $USER:$USER /opt/vault
+Subtask 1.2: Initialize and Configure Vault
+Step 1: Start Vault server
+
+# Start Vault in development mode for this lab
+vault server -config=/opt/vault/config/vault.hcl > /opt/vault/logs/vault.log 2>&1 &
+
+# Wait for Vault to start
+sleep 5
+
+# Set environment variable
+export VAULT_ADDR='http://127.0.0.1:8200'
+Step 2: Initialize Vault
+
+# Initialize Vault and save keys
+vault operator init -key-shares=5 -key-threshold=3 > /opt/vault/init-keys.txt
+
+# Display the initialization output
+cat /opt/vault/init-keys.txt
+Step 3: Unseal Vault
+
+# Extract unseal keys (you'll need 3 of the 5 keys)
+UNSEAL_KEY_1=$(grep 'Unseal Key 1:' /opt/vault/init-keys.txt | awk '{print $4}')
+UNSEAL_KEY_2=$(grep 'Unseal Key 2:' /opt/vault/init-keys.txt | awk '{print $4}')
+UNSEAL_KEY_3=$(grep 'Unseal Key 3:' /opt/vault/init-keys.txt | awk '{print $4}')
+
+# Unseal Vault
+vault operator unseal $UNSEAL_KEY_1
+vault operator unseal $UNSEAL_KEY_2
+vault operator unseal $UNSEAL_KEY_3
+
+# Verify Vault status
+vault status
+Step 4: Authenticate with root token
+
+# Extract root token
+ROOT_TOKEN=$(grep 'Initial Root Token:' /opt/vault/init-keys.txt | awk '{print $4}')
+
+# Login with root token
+vault auth $ROOT_TOKEN
+
+# Verify authentication
+vault token lookup
+Subtask 1.3: Create Sample Data for Backup
+Step 1: Enable KV secrets engine
+
+# Enable KV version 2 secrets engine
+vault secrets enable -version=2 kv
+
+# Verify secrets engines
+vault secrets list
+Step 2: Create sample secrets
+
+# Create various secrets for backup testing
+vault kv put kv/database username="dbadmin" password="secretpass123"
+vault kv put kv/api-keys github="ghp_1234567890abcdef" aws="AKIA1234567890ABCDEF"
+vault kv put kv/certificates ssl-cert="-----BEGIN CERTIFICATE-----" ssl-key="-----BEGIN PRIVATE KEY-----"
+vault kv put kv/application config='{"debug": true, "port": 8080}' version="1.2.3"
+
+# Create nested secrets
+vault kv put kv/prod/database host="prod-db.example.com" port="5432" username="produser"
+vault kv put kv/dev/database host="dev-db.example.com" port="5432" username="devuser"
+Step 3: Create policies and authentication methods
+
+# Create a sample policy
+vault policy write app-policy - <<EOF
+path "kv/data/application/*" {
+  capabilities = ["read", "list"]
+}
+
+path "kv/data/database" {
+  capabilities = ["read"]
+}
+EOF
+
+# Enable userpass authentication
+vault auth enable userpass
+
+# Create a user
+vault write auth/userpass/users/appuser password="userpass123" policies="app-policy"
+
+# List all policies
+vault policy list
+Subtask 1.4: Perform Physical Backup
+Step 1: Create backup script
+
+# Create backup script
+tee /opt/vault/backup-vault.sh > /dev/null <<'EOF'
+#!/bin/bash
+
+# Vault backup script
+BACKUP_DIR="/opt/vault/backups"
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+BACKUP_NAME="vault_backup_${TIMESTAMP}"
+
+echo "Starting Vault backup at $(date)"
+
+# Create backup directory for this backup
+mkdir -p "${BACKUP_DIR}/${BACKUP_NAME}"
+
+# Backup Vault data directory
+echo "Backing up Vault data..."
+cp -r /opt/vault/data "${BACKUP_DIR}/${BACKUP_NAME}/"
+
+# Backup Vault configuration
+echo "Backing up Vault configuration..."
+cp -r /opt/vault/config "${BACKUP_DIR}/${BACKUP_NAME}/"
+
+# Backup initialization keys (in production, store securely)
+echo "Backing up initialization keys..."
+cp /opt/vault/init-keys.txt "${BACKUP_DIR}/${BACKUP_NAME}/"
+
+# Create backup manifest
+echo "Creating backup manifest..."
+cat > "${BACKUP_DIR}/${BACKUP_NAME}/backup_manifest.txt" <<MANIFEST
+Vault Backup Information
+========================
+Backup Date: $(date)
+Backup Name: ${BACKUP_NAME}
+Vault Version: $(vault version | head -1)
+Backup Contents:
+- data/: Vault storage backend data
+- config/: Vault configuration files
+- init-keys.txt: Vault initialization keys and root token
+
+Verification Commands:
+- Check data integrity: find data/ -type f -exec sha256sum {} \;
+- Verify configuration: vault server -config=config/vault.hcl -test-config
+MANIFEST
+
+# Create checksums for integrity verification
+echo "Creating checksums..."
+find "${BACKUP_DIR}/${BACKUP_NAME}" -type f -exec sha256sum {} \; > "${BACKUP_DIR}/${BACKUP_NAME}/checksums.txt"
+
+# Create compressed archive
+echo "Creating compressed archive..."
+cd "${BACKUP_DIR}"
+tar -czf "${BACKUP_NAME}.tar.gz" "${BACKUP_NAME}/"
+
+echo "Backup completed successfully!"
+echo "Backup location: ${BACKUP_DIR}/${BACKUP_NAME}.tar.gz"
+echo "Backup size: $(du -h ${BACKUP_NAME}.tar.gz | cut -f1)"
+EOF
+
+# Make script executable
+chmod +x /opt/vault/backup-vault.sh
+Step 2: Execute backup
+
+# Run the backup script
+/opt/vault/backup-vault.sh
+
+# Verify backup was created
+ls -la /opt/vault/backups/
+
+# Check backup contents
+LATEST_BACKUP=$(ls -t /opt/vault/backups/*.tar.gz | head -1)
+echo "Latest backup: $LATEST_BACKUP"
+tar -tzf $LATEST_BACKUP | head -20
+Step 3: Create snapshot using Vault API
+
+# Create API-based snapshot
+vault operator raft snapshot save /opt/vault/backups/vault-snapshot-$(date +%Y%m%d_%H%M%S).snap
+
+# Verify snapshot
+ls -la /opt/vault/backups/*.snap
+Subtask 1.5: Verify Backup Integrity
+Step 1: Verify backup checksums
+
+# Extract latest backup for verification
+cd /opt/vault/backups
+LATEST_BACKUP_DIR=$(ls -td vault_backup_* | head -1)
+echo "Verifying backup: $LATEST_BACKUP_DIR"
+
+# Verify checksums
+cd "$LATEST_BACKUP_DIR"
+sha256sum -c checksums.txt
+
+# Display backup manifest
+cat backup_manifest.txt
+Step 2: Test configuration validity
+
+# Test Vault configuration from backup
+vault server -config=config/vault.hcl -test-config
+echo "Configuration test result: $?"
+Task 2: Restore Vault Data from Backup and Verify Consistency
+Subtask 2.1: Simulate Disaster Scenario
+Step 1: Document current state
+
+# Document current secrets before disaster
+echo "=== Current Vault State Before Disaster ===" > /opt/vault/pre-disaster-state.txt
+vault kv list kv/ >> /opt/vault/pre-disaster-state.txt
+echo "" >> /opt/vault/pre-disaster-state.txt
+vault policy list >> /opt/vault/pre-disaster-state.txt
+echo "" >> /opt/vault/pre-disaster-state.txt
+vault auth list >> /opt/vault/pre-disaster-state.txt
+
+# Display current state
+cat /opt/vault/pre-disaster-state.txt
+Step 2: Simulate data corruption/loss
+
+# Stop Vault server
+pkill vault
+sleep 3
+
+# Simulate disaster by removing data
+echo "Simulating disaster - removing Vault data..."
+rm -rf /opt/vault/data/*
+rm -f /opt/vault/logs/vault.log
+
+# Verify data is gone
+ls -la /opt/vault/data/
+Subtask 2.2: Restore from Physical Backup
+Step 1: Extract backup
+
+# Find latest backup
+cd /opt/vault/backups
+LATEST_BACKUP=$(ls -t vault_backup_*.tar.gz | head -1)
+echo "Restoring from backup: $LATEST_BACKUP"
+
+# Extract backup
+tar -xzf "$LATEST_BACKUP"
+BACKUP_DIR=$(basename "$LATEST_BACKUP" .tar.gz)
+
+# Verify backup contents
+ls -la "$BACKUP_DIR/"
+Step 2: Restore data and configuration
+
+# Restore Vault data
+echo "Restoring Vault data..."
+cp -r "${BACKUP_DIR}/data/"* /opt/vault/data/
+
+# Restore configuration (if needed)
+echo "Verifying configuration..."
+diff "${BACKUP_DIR}/config/vault.hcl" /opt/vault/config/vault.hcl
+
+# Restore initialization keys
+cp "${BACKUP_DIR}/init-keys.txt" /opt/vault/init-keys-restored.txt
+
+# Set proper permissions
+chown -R $USER:$USER /opt/vault/data
+Step 3: Start Vault and unseal
+
+# Start Vault server
+vault server -config=/opt/vault/config/vault.hcl > /opt/vault/logs/vault-restored.log 2>&1 &
+
+# Wait for startup
+sleep 5
+
+# Check if Vault is sealed
+vault status
+
+# Unseal Vault using restored keys
+UNSEAL_KEY_1=$(grep 'Unseal Key 1:' /opt/vault/init-keys-restored.txt | awk '{print $4}')
+UNSEAL_KEY_2=$(grep 'Unseal Key 2:' /opt/vault/init-keys-restored.txt | awk '{print $4}')
+UNSEAL_KEY_3=$(grep 'Unseal Key 3:' /opt/vault/init-keys-restored.txt | awk '{print $4}')
+
+vault operator unseal $UNSEAL_KEY_1
+vault operator unseal $UNSEAL_KEY_2
+vault operator unseal $UNSEAL_KEY_3
+
+# Verify Vault is unsealed
+vault status
+Subtask 2.3: Verify Data Consistency
+Step 1: Authenticate and verify access
+
+# Extract and use root token
+ROOT_TOKEN=$(grep 'Initial Root Token:' /opt/vault/init-keys-restored.txt | awk '{print $4}')
+vault auth $ROOT_TOKEN
+
+# Verify authentication
+vault token lookup
+Step 2: Verify secrets restoration
+
+# Create post-restoration state document
+echo "=== Vault State After Restoration ===" > /opt/vault/post-restore-state.txt
+vault kv list kv/ >> /opt/vault/post-restore-state.txt
+echo "" >> /opt/vault/post-restore-state.txt
+vault policy list >> /opt/vault/post-restore-state.txt
+echo "" >> /opt/vault/post-restore-state.txt
+vault auth list >> /opt/vault/post-restore-state.txt
+
+# Compare pre and post disaster states
+echo "=== Comparing Pre-Disaster and Post-Restore States ==="
+diff /opt/vault/pre-disaster-state.txt /opt/vault/post-restore-state.txt
+if [ $? -eq 0 ]; then
+    echo "SUCCESS: States match perfectly!"
+else
+    echo "WARNING: States differ - manual verification needed"
+fi
+Step 3: Verify specific secrets
+
+# Test specific secret retrieval
+echo "=== Verifying Individual Secrets ==="
+
+# Test database secrets
+echo "Database secrets:"
+vault kv get kv/database
+
+# Test API keys
+echo "API keys:"
+vault kv get kv/api-keys
+
+# Test nested secrets
+echo "Production database:"
+vault kv get kv/prod/database
+
+echo "Development database:"
+vault kv get kv/dev/database
+
+# Test application config
+echo "Application config:"
+vault kv get kv/application
+Step 4: Verify policies and authentication
+
+# Test policy functionality
+echo "=== Verifying Policies and Authentication ==="
+
+# Check if policies exist
+vault policy read app-policy
+
+# Test user authentication
+echo "Testing user authentication..."
+vault auth -method=userpass username=appuser password=userpass123
+
+# Test user permissions (should work)
+vault kv get kv/application
+
+# Test restricted access (should fail)
+vault kv get kv/api-keys 2>&1 | grep -q "permission denied" && echo "Policy restriction working correctly" || echo "Policy restriction failed"
+
+# Re-authenticate as root for remaining tasks
+vault auth $ROOT_TOKEN
+Subtask 2.4: Create Automated Restoration Script
+Step 1: Create comprehensive restoration script
+
+# Create restoration script
+tee /opt/vault/restore-vault.sh > /dev/null <<'EOF'
+#!/bin/bash
+
+# Vault restoration script
+BACKUP_DIR="/opt/vault/backups"
+VAULT_DIR="/opt/vault"
+
+# Function to display usage
+usage() {
+    echo "Usage: $0 [backup_name|latest]"
+    echo "Example: $0 vault_backup_20231201_143022"
+    echo "Example: $0 latest"
+    exit 1
+}
+
+# Function to stop Vault
+stop_vault() {
+    echo "Stopping Vault server..."
+    pkill vault
+    sleep 3
+}
+
+# Function to start and unseal Vault
+start_and_unseal_vault() {
+    echo "Starting Vault server..."
+    vault server -config=${VAULT_DIR}/config/vault.hcl > ${VAULT_DIR}/logs/vault-restored.log 2>&1 &
+    
+    sleep 5
+    
+    echo "Unsealing Vault..."
+    UNSEAL_KEY_1=$(grep 'Unseal Key 1:' ${VAULT_DIR}/init-keys-restored.txt | awk '{print $4}')
+    UNSEAL_KEY_2=$(grep 'Unseal Key 2:' ${VAULT_DIR}/init-keys-restored.txt | awk '{print $4}')
+    UNSEAL_KEY_3=$(grep 'Unseal Key 3:' ${VAULT_DIR}/init-keys-restored.txt | awk '{print $4}')
+    
+    vault operator unseal $UNSEAL_KEY_1
+    vault operator unseal $UNSEAL_KEY_2
+    vault operator unseal $UNSEAL_KEY_3
+}
+
+# Function to verify restoration
+verify_restoration() {
+    echo "Verifying restoration..."
+    
+    # Get root token and authenticate
+    ROOT_TOKEN=$(grep 'Initial Root Token:' ${VAULT_DIR}/init-keys-restored.txt | awk '{print $4}')
+    vault auth $ROOT_TOKEN
+    
+    # Basic verification
+    echo "Vault status:"
+    vault status
+    
+    echo "Available secrets engines:"
+    vault secrets list
+    
+    echo "Available authentication methods:"
+    vault auth list
+    
+    echo "Available policies:"
+    vault policy list
+    
+    echo "Sample secret verification:"
+    vault kv get kv/database 2>/dev/null && echo "✓ Secrets accessible" || echo "✗ Secrets not accessible"
+}
+
+# Main script logic
+if [ $# -ne 1 ]; then
+    usage
+fi
+
+BACKUP_NAME=$1
+
+# Determine backup to restore
+if [ "$BACKUP_NAME" = "latest" ]; then
+    BACKUP_FILE=$(ls -t ${BACKUP_DIR}/vault_backup_*.tar.gz 2>/dev/null | head -1)
+    if [ -z "$BACKUP_FILE" ]; then
+        echo "Error: No backups found in $BACKUP_DIR"
+        exit 1
+    fi
+    BACKUP_NAME=$(basename "$BACKUP_FILE" .tar.gz)
+else
+    BACKUP_FILE="${BACKUP_DIR}/${BACKUP_NAME}.tar.gz"
+    if [ ! -f "$BACKUP_FILE" ]; then
+        echo "Error: Backup file $BACKUP_FILE not found"
+        exit 1
+    fi
+fi
+
+echo "Starting restoration process..."
+echo "Backup file: $BACKUP_FILE"
+echo "Backup name: $BACKUP_NAME"
+
+# Stop Vault
+stop_vault
+
+# Extract backup
+echo "Extracting backup..."
+cd "$BACKUP_DIR"
+tar -xzf "${BACKUP_NAME}.tar.gz"
+
+# Verify backup integrity
+echo "Verifying backup integrity..."
+cd "$BACKUP_NAME"
+if sha256sum -c checksums.txt > /dev/null 2>&1; then
+    echo "✓ Backup integrity verified"
+else
+    echo "✗ Backup integrity check failed"
+    exit 1
+fi
+
+# Restore data
+echo "Restoring Vault data..."
+rm -rf ${VAULT_DIR}/data/*
+cp -r data/* ${VAULT_DIR}/data/
+
+# Restore keys
+cp init-keys.txt ${VAULT_DIR}/init-keys-restored.txt
+
+# Set permissions
+chown -R $USER:$USER ${VAULT_DIR}/data
+
+# Start and unseal Vault
+start_and_unseal_vault
+
+# Verify restoration
+verify_restoration
+
+echo "Restoration completed successfully!"
+EOF
+
+# Make script executable
+chmod +x /opt/vault/restore-vault.sh
+Step 2: Test automated restoration
+
+# Test the restoration script
+echo "Testing automated restoration script..."
+
+# First, create a new backup to test with
+/opt/vault/backup-vault.sh
+
+# Simulate another disaster
+pkill vault
+sleep 3
+rm -rf /opt/vault/data/*
+
+# Use restoration script
+/opt/vault/restore-vault.sh latest
+
+# Verify the restoration worked
+vault status
+Subtask 2.5: Document Disaster Recovery Procedures
+Step 1: Create disaster recovery documentation
+
+# Create comprehensive DR documentation
+tee /opt/vault/DISASTER_RECOVERY_PROCEDURES.md > /dev/null <<'EOF'
+# Vault Disaster Recovery Procedures
+
+## Overview
+This document outlines the procedures for backing up and restoring HashiCorp Vault data in case of disasters.
+
+## Backup Procedures
+
+### Automated Backup
+- **Script Location**: `/opt/vault/backup-vault.sh`
+- **Backup Location**: `/opt/vault/backups/`
+- **Frequency**: Run daily via cron job
+- **Retention**: Keep 30 days of backups
+
+### Manual Backup
+```bash
+# Run backup script
+/opt/vault/backup-vault.sh
+
+# Create snapshot
+vault operator raft snapshot save /opt/vault/backups/vault-snapshot-$(date +%Y%m%d_%H%M%S).snap
+Restoration Procedures
+Prerequisites
+Vault binary installed
+Configuration files available
+Backup files accessible
+Unseal keys available
+Automated Restoration
+# Restore from latest backup
+/opt/vault/restore-vault.sh latest
+
+# Restore from specific backup
+/opt/vault/restore-vault.sh vault_backup_20231201_143022
+Manual Restoration Steps
+Stop Vault server: pkill vault
+Extract backup: tar -xzf backup_file.tar.gz
+Restore data: cp -r backup_data/* /opt/vault/data/
+Start Vault: vault server -config=/opt/vault/config/vault.hcl &
+Unseal Vault with 3 unseal keys
+Verify data integrity
+Verification Checklist
+ Vault status shows unsealed
+ All secrets engines available
+ Authentication methods working
+ Policies intact
+ Sample secrets accessible
+ User authentication functional
+Emergency Contacts
+System Administrator: [contact info]
+Security Team: [contact info]
+Vault Administrator: [contact info]
+Recovery Time Objectives (RTO)
+Target RTO: 30 minutes
+Maximum RTO: 2 hours
+Recovery Point Objectives (RPO)
+Target RPO: 24 hours (daily backups)
+Maximum RPO: 48 hours
+Testing Schedule
+Monthly: Test backup creation
+Quarterly: Test full restoration procedure
+Annually: Disaster recovery drill EOF
+echo "Disaster recovery documentation created at /opt/vault/DISASTER_RECOVERY_PROCEDURES.md"
+
+
+**Step 2: Create monitoring and alerting script**
+
+```bash
+# Create monitoring script for backup health
+tee /opt/vault/monitor-backups.sh > /dev/null <<'EOF'
+#!/bin/bash
+
+# Vault backup monitoring script
+BACKUP_DIR="/opt/vault/backups"
+MAX_AGE_HOURS=25  # Alert if latest backup is older than 25 hours
+MIN_BACKUPS=3     # Alert if fewer than 3 backups exist
+
+# Function to send alert (customize as needed)
+send_alert() {
+    local message="$1"
+    echo "ALERT: $message"
+    # Add your alerting mechanism here (email, Slack, etc.)
+    logger "VAULT_BACKUP_ALERT: $message"
+}
+
+# Check if backup directory exists
+if [ ! -d "$BACKUP_DIR" ]; then
+    send_alert "Backup directory $BACKUP_DIR does not exist"
+    exit 1
+fi
+
+# Check number of backups
+backup_count=$(ls -1 ${BACKUP_DIR}/vault_backup_*.tar.gz 2>/dev/null | wc -l)
+if [ $backup_count -lt $MIN_BACKUPS ]; then
+    send_alert "Only $backup_count backups found, minimum required: $MIN_BACKUPS"
+fi
+
+# Check age of latest backup
+latest_backup=$(ls -t ${BACKUP_DIR}/vault_backup_*.tar.gz 2>/dev/null | head -1)
+if [ -n "$latest_backup" ]; then
+    backup_age_seconds=$(( $(date +%s) - $(stat -c %Y "$latest_backup") ))
+    backup_age_hours=$(( backup_age_seconds / 3600 ))
+    
+    if [ $backup_age_hours -gt $MAX_AGE_HOURS ]; then
+        send_alert "Latest backup is $backup_age_hours hours old, maximum allowed: $MAX_AGE_HOURS hours"
+    else
+        echo "✓ Latest backup is $backup_age_hours hours old (within acceptable range)"
+    fi
+else
+    send_alert "No backups found in $BACKUP_DIR"
+fi
+
+# Verify latest backup integrity
+if [ -n "$latest_backup" ]; then
+    backup_name=$(basename "$latest_backup" .tar.gz)
+    temp_dir="/tmp/vault_backup_check_$$"
+    
+    mkdir -p "$temp_dir"
+    cd "$temp_dir"
+    
+    if tar -xzf "$latest_backup" 2>/dev/null; then
+        cd "$backup_name"
+        if sha256sum -c checksums.txt >/dev/null 2>&1; then
+            echo "✓ Latest backup integrity verified"
+        else
+            send_alert "Latest backup failed integrity check"
+        fi
+    else
+        send_alert "Failed to extract latest backup for verification"
+    fi
+    
+    # Cleanup
+    rm -rf "$temp_dir"
+fi
+
+echo "Backup monitoring completed at $(date)"
+EOF
+
+# Make monitoring script executable
+chmod +x /opt/vault/monitor-backups.sh
+
+# Test monitoring script
+/opt/vault/monitor-backups.sh
+Troubleshooting Common Issues
+Issue 1: Vault Won't Start After Restoration
+Symptoms: Vault server fails to start after restoration
+
+Solutions:
+
+# Check configuration syntax
+vault server -config=/opt/vault/config/vault.hcl -test-config
+
+# Check file permissions
+ls -la /opt/vault/data/
+chown -R $USER:$USER /opt/vault/data
+
+# Check for port conflicts
+netstat -tlnp | grep 8200
+
+# Review logs
+tail -f /opt/vault/logs/vault-restored.log
+Issue 2: Cannot Unseal Vault
+Symptoms: Unseal operation fails with invalid key error
+
+Solutions:
+
+# Verify unseal keys format
+cat /opt/vault/init-keys-restored.txt
+
+# Check Vault status
+vault status
+
+# Try unsealing with different key combination
+vault operator unseal [different-key]
+
+# Reset and re-initialize if necessary (last resort)
+Issue 3: Secrets Not Accessible After Restoration
+Symptoms: Authentication works but secrets return "not found" errors
+
+Solutions:
+
+# Check secrets engines
+vault secrets list
+
+# Verify data directory contents
+ls -la /opt/vault/data/
+
+# Check authentication and permissions
+vault token lookup
+vault policy list
+
+# Re-enable secrets engine if necessary
+vault secrets enable -version=2 kv
+Issue 4: Backup Integrity Check Fails
+Symptoms: Checksum verification fails during restoration
+
+Solutions:
+
+# Check backup file corruption
+tar -tzf backup_file.tar.gz
+
+# Try different backup
+ls -la /opt/vault/backups/
+
+# Manual checksum verification
+sha256sum backup_file.tar.gz
+
+# Restore from snapshot instead
+vault operator raft snapshot restore snapshot_file.snap
+Conclusion
+In this lab, you have successfully implemented a comprehensive disaster recovery solution for HashiCorp Vault. You learned how to:
+
+Create reliable backups of Vault data, configuration, and keys using both file-based and snapshot methods
+Implement automated backup procedures with integrity verification and monitoring
+Perform complete disaster recovery by restoring Vault from backups and verifying data consistency
+Verify restoration success by testing authentication, policies, and secret accessibility
+Document procedures for operational teams and create monitoring scripts for ongoing backup health
+These skills are crucial for maintaining high availability and data protection in production Vault environments. The backup and restoration procedures you've implemented provide multiple recovery options and ensure business continuity in case of system failures, data corruption, or other disaster scenarios.
+
+The automated scripts and monitoring tools you created will help maintain consistent backup practices and provide early warning of potential issues. Regular testing of these procedures ensures that your disaster recovery plan remains effective and up-to-date.
+
+Remember to adapt these procedures to your specific environment requirements, including secure storage of unseal keys, network configurations, and organizational policies for backup retention and testing schedules.
