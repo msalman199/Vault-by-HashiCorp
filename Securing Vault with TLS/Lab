@@ -1,0 +1,305 @@
+ Securing Vault with TLS
+Lab Objectives
+By the end of this lab, you will be able to:
+
+Install and configure HashiCorp Vault on a Linux system
+Generate and configure TLS certificates for Vault encryption
+Set up Vault with TLS encryption to secure data in transit
+Implement mutual TLS (mTLS) authentication for enhanced security
+Verify TLS and mTLS configurations are working correctly
+Understand the importance of certificate-based security in production environments
+Prerequisites
+Before starting this lab, you should have:
+
+Basic understanding of Linux command line operations
+Familiarity with file permissions and directory structures
+Basic knowledge of PKI (Public Key Infrastructure) concepts
+Understanding of TLS/SSL fundamentals
+Basic knowledge of JSON configuration files
+Lab Environment
+Al Nafi provides Linux-based cloud machines for this lab. Simply click Start Lab to access your dedicated Linux machine. The provided Linux machine is bare metal with no pre-installed tools, so you will need to install all required tools during the lab following the instructions provided.
+
+Task 1: Set up Vault with TLS Encryption
+Subtask 1.1: Install Required Tools
+First, we need to install HashiCorp Vault and OpenSSL for certificate generation.
+
+Update the system package manager:
+sudo apt update && sudo apt upgrade -y
+Install required dependencies:
+sudo apt install -y wget unzip openssl curl jq
+Download and install HashiCorp Vault:
+# Download Vault
+wget https://releases.hashicorp.com/vault/1.15.2/vault_1.15.2_linux_amd64.zip
+
+# Unzip the binary
+unzip vault_1.15.2_linux_amd64.zip
+
+# Move to system path
+sudo mv vault /usr/local/bin/
+
+# Verify installation
+vault version
+Create a dedicated user for Vault:
+sudo useradd --system --home /etc/vault.d --shell /bin/false vault
+Subtask 1.2: Create Directory Structure
+Create the necessary directories for Vault configuration and data:
+
+# Create Vault directories
+sudo mkdir -p /etc/vault.d
+sudo mkdir -p /opt/vault/data
+sudo mkdir -p /opt/vault/logs
+sudo mkdir -p /opt/vault/tls
+
+# Set proper ownership
+sudo chown -R vault:vault /etc/vault.d
+sudo chown -R vault:vault /opt/vault
+Subtask 1.3: Generate TLS Certificates
+Create a Certificate Authority (CA) and server certificates for TLS encryption:
+
+Create a CA private key:
+sudo openssl genrsa -out /opt/vault/tls/ca-key.pem 4096
+Create a CA certificate:
+sudo openssl req -new -x509 -days 365 -key /opt/vault/tls/ca-key.pem -out /opt/vault/tls/ca-cert.pem -subj "/C=US/ST=CA/L=San Francisco/O=Lab/OU=IT/CN=Vault-CA"
+Create a server private key:
+sudo openssl genrsa -out /opt/vault/tls/vault-key.pem 4096
+Create a certificate signing request (CSR):
+sudo openssl req -new -key /opt/vault/tls/vault-key.pem -out /opt/vault/tls/vault.csr -subj "/C=US/ST=CA/L=San Francisco/O=Lab/OU=IT/CN=localhost"
+Create a server certificate signed by the CA:
+sudo openssl x509 -req -days 365 -in /opt/vault/tls/vault.csr -CA /opt/vault/tls/ca-cert.pem -CAkey /opt/vault/tls/ca-key.pem -CAcreateserial -out /opt/vault/tls/vault-cert.pem -extensions v3_req -extfile <(cat <<EOF
+[v3_req]
+keyUsage = keyEncipherment, dataEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = localhost
+IP.1 = 127.0.0.1
+EOF
+)
+Set proper permissions on certificates:
+sudo chmod 400 /opt/vault/tls/vault-key.pem
+sudo chmod 444 /opt/vault/tls/vault-cert.pem
+sudo chmod 444 /opt/vault/tls/ca-cert.pem
+sudo chown -R vault:vault /opt/vault/tls
+Subtask 1.4: Configure Vault with TLS
+Create a Vault configuration file with TLS enabled:
+
+sudo tee /etc/vault.d/vault.hcl > /dev/null <<EOF
+storage "file" {
+  path = "/opt/vault/data"
+}
+
+listener "tcp" {
+  address     = "127.0.0.1:8200"
+  tls_cert_file = "/opt/vault/tls/vault-cert.pem"
+  tls_key_file  = "/opt/vault/tls/vault-key.pem"
+  tls_min_version = "tls12"
+}
+
+api_addr = "https://127.0.0.1:8200"
+cluster_addr = "https://127.0.0.1:8201"
+ui = true
+log_level = "INFO"
+EOF
+Subtask 1.5: Start Vault Server
+Create a systemd service file for Vault:
+sudo tee /etc/systemd/system/vault.service > /dev/null <<EOF
+[Unit]
+Description=HashiCorp Vault
+Documentation=https://www.vaultproject.io/docs/
+Requires=network-online.target
+After=network-online.target
+ConditionFileNotEmpty=/etc/vault.d/vault.hcl
+
+[Service]
+Type=notify
+User=vault
+Group=vault
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+SecureBits=keep-caps
+AmbientCapabilities=CAP_IPC_LOCK
+NoNewPrivileges=yes
+ExecStart=/usr/local/bin/vault server -config=/etc/vault.d/vault.hcl
+ExecReload=/bin/kill -HUP \$MAINPID
+KillMode=process
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+StartLimitBurst=3
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+Enable and start the Vault service:
+sudo systemctl daemon-reload
+sudo systemctl enable vault
+sudo systemctl start vault
+Check the service status:
+sudo systemctl status vault
+Subtask 1.6: Initialize and Unseal Vault
+Set the Vault address environment variable:
+export VAULT_ADDR='https://127.0.0.1:8200'
+export VAULT_CACERT='/opt/vault/tls/ca-cert.pem'
+Initialize Vault:
+vault operator init -key-shares=5 -key-threshold=3 > /tmp/vault-init.txt
+Extract the unseal keys and root token:
+# Display the initialization output
+cat /tmp/vault-init.txt
+
+# Extract unseal keys (you'll need these)
+UNSEAL_KEY_1=$(grep 'Unseal Key 1:' /tmp/vault-init.txt | awk '{print $4}')
+UNSEAL_KEY_2=$(grep 'Unseal Key 2:' /tmp/vault-init.txt | awk '{print $4}')
+UNSEAL_KEY_3=$(grep 'Unseal Key 3:' /tmp/vault-init.txt | awk '{print $4}')
+ROOT_TOKEN=$(grep 'Initial Root Token:' /tmp/vault-init.txt | awk '{print $4}')
+Unseal Vault using three keys:
+vault operator unseal $UNSEAL_KEY_1
+vault operator unseal $UNSEAL_KEY_2
+vault operator unseal $UNSEAL_KEY_3
+Authenticate with the root token:
+vault auth $ROOT_TOKEN
+Verify TLS is working:
+vault status
+Task 2: Implement Mutual TLS for Secure Communication
+Subtask 2.1: Generate Client Certificates
+Create client certificates for mutual TLS authentication:
+
+Generate a client private key:
+sudo openssl genrsa -out /opt/vault/tls/client-key.pem 4096
+Create a client certificate signing request:
+sudo openssl req -new -key /opt/vault/tls/client-key.pem -out /opt/vault/tls/client.csr -subj "/C=US/ST=CA/L=San Francisco/O=Lab/OU=IT/CN=vault-client"
+Sign the client certificate with the CA:
+sudo openssl x509 -req -days 365 -in /opt/vault/tls/client.csr -CA /opt/vault/tls/ca-cert.pem -CAkey /opt/vault/tls/ca-key.pem -CAcreateserial -out /opt/vault/tls/client-cert.pem -extensions v3_req -extfile <(cat <<EOF
+[v3_req]
+keyUsage = keyEncipherment, dataEncipherment, digitalSignature
+extendedKeyUsage = clientAuth
+EOF
+)
+Set proper permissions:
+sudo chmod 400 /opt/vault/tls/client-key.pem
+sudo chmod 444 /opt/vault/tls/client-cert.pem
+sudo chown -R vault:vault /opt/vault/tls
+Subtask 2.2: Configure Vault for Mutual TLS
+Stop the Vault service:
+sudo systemctl stop vault
+Update the Vault configuration to require client certificates:
+sudo tee /etc/vault.d/vault.hcl > /dev/null <<EOF
+storage "file" {
+  path = "/opt/vault/data"
+}
+
+listener "tcp" {
+  address     = "127.0.0.1:8200"
+  tls_cert_file = "/opt/vault/tls/vault-cert.pem"
+  tls_key_file  = "/opt/vault/tls/vault-key.pem"
+  tls_client_ca_file = "/opt/vault/tls/ca-cert.pem"
+  tls_require_and_verify_client_cert = true
+  tls_min_version = "tls12"
+}
+
+api_addr = "https://127.0.0.1:8200"
+cluster_addr = "https://127.0.0.1:8201"
+ui = true
+log_level = "INFO"
+EOF
+Start the Vault service:
+sudo systemctl start vault
+Check the service status:
+sudo systemctl status vault
+Subtask 2.3: Configure Client for Mutual TLS
+Update environment variables to include client certificates:
+export VAULT_ADDR='https://127.0.0.1:8200'
+export VAULT_CACERT='/opt/vault/tls/ca-cert.pem'
+export VAULT_CLIENT_CERT='/opt/vault/tls/client-cert.pem'
+export VAULT_CLIENT_KEY='/opt/vault/tls/client-key.pem'
+Test the mutual TLS connection:
+vault status
+Authenticate with the root token:
+vault auth $ROOT_TOKEN
+Subtask 2.4: Test Mutual TLS Authentication
+Create a test secret to verify functionality:
+vault kv put secret/test-mtls username="testuser" password="securepass123"
+Retrieve the secret:
+vault kv get secret/test-mtls
+Test without client certificates (this should fail):
+# Temporarily unset client certificate variables
+unset VAULT_CLIENT_CERT
+unset VAULT_CLIENT_KEY
+
+# This should fail with a TLS error
+vault status
+Restore client certificates:
+export VAULT_CLIENT_CERT='/opt/vault/tls/client-cert.pem'
+export VAULT_CLIENT_KEY='/opt/vault/tls/client-key.pem'
+
+# This should work again
+vault status
+Subtask 2.5: Create Additional Client Certificates
+Create another client certificate to demonstrate multiple client access:
+
+Generate another client private key:
+sudo openssl genrsa -out /opt/vault/tls/client2-key.pem 4096
+Create a certificate signing request:
+sudo openssl req -new -key /opt/vault/tls/client2-key.pem -out /opt/vault/tls/client2.csr -subj "/C=US/ST=CA/L=San Francisco/O=Lab/OU=IT/CN=vault-client2"
+Sign the certificate:
+sudo openssl x509 -req -days 365 -in /opt/vault/tls/client2.csr -CA /opt/vault/tls/ca-cert.pem -CAkey /opt/vault/tls/ca-key.pem -CAcreateserial -out /opt/vault/tls/client2-cert.pem -extensions v3_req -extfile <(cat <<EOF
+[v3_req]
+keyUsage = keyEncipherment, dataEncipherment, digitalSignature
+extendedKeyUsage = clientAuth
+EOF
+)
+Test with the second client certificate:
+export VAULT_CLIENT_CERT='/opt/vault/tls/client2-cert.pem'
+export VAULT_CLIENT_KEY='/opt/vault/tls/client2-key.pem'
+
+vault status
+vault auth $ROOT_TOKEN
+vault kv get secret/test-mtls
+Subtask 2.6: Verify Certificate Details
+Examine the server certificate:
+openssl x509 -in /opt/vault/tls/vault-cert.pem -text -noout | grep -A 5 "Subject:"
+Examine the client certificate:
+openssl x509 -in /opt/vault/tls/client-cert.pem -text -noout | grep -A 5 "Subject:"
+Verify certificate chain:
+openssl verify -CAfile /opt/vault/tls/ca-cert.pem /opt/vault/tls/vault-cert.pem
+openssl verify -CAfile /opt/vault/tls/ca-cert.pem /opt/vault/tls/client-cert.pem
+Troubleshooting Tips
+Common Issues and Solutions
+Issue: Vault fails to start with TLS configuration
+
+Solution: Check certificate file permissions and paths in the configuration file
+Command: sudo journalctl -u vault -f to view logs
+Issue: Client certificate authentication fails
+
+Solution: Verify that the client certificate is signed by the same CA as configured in Vault
+Command: openssl verify -CAfile /opt/vault/tls/ca-cert.pem /opt/vault/tls/client-cert.pem
+Issue: TLS handshake errors
+
+Solution: Ensure that the server certificate includes the correct Subject Alternative Names (SAN)
+Command: openssl x509 -in /opt/vault/tls/vault-cert.pem -text -noout | grep -A 5 "Subject Alternative Name"
+Issue: Permission denied errors
+
+Solution: Verify that the vault user has read access to certificate files
+Command: sudo ls -la /opt/vault/tls/
+Verification Steps
+Verify TLS is enabled:
+curl -k https://127.0.0.1:8200/v1/sys/health
+Verify mutual TLS is working:
+curl --cert /opt/vault/tls/client-cert.pem --key /opt/vault/tls/client-key.pem --cacert /opt/vault/tls/ca-cert.pem https://127.0.0.1:8200/v1/sys/health
+Verify certificate expiration:
+openssl x509 -in /opt/vault/tls/vault-cert.pem -noout -dates
+Conclusion
+In this lab, you have successfully:
+
+Installed and configured HashiCorp Vault on a Linux system
+Generated a complete PKI infrastructure with CA and server certificates
+Configured Vault to use TLS encryption for secure communication
+Implemented mutual TLS authentication requiring client certificates
+Created and tested multiple client certificates
+Verified that both server and client authentication work correctly
+Why This Matters: TLS and mutual TLS are critical security measures in production environments. TLS encrypts data in transit, preventing eavesdropping and man-in-the-middle attacks. Mutual TLS adds an additional layer of security by requiring clients to present valid certificates, ensuring that only authorized clients can access the Vault server. This is especially important for secrets management systems like Vault, where unauthorized access could compromise sensitive data across an entire organization.
+
+The skills you've learned in this lab are directly applicable to securing production Vault deployments and other services that require strong authentication and encryption. Understanding certificate management and TLS configuration is essential for maintaining secure infrastructure in modern cloud and on-premises environments.
