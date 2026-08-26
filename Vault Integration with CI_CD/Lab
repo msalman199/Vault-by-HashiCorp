@@ -1,0 +1,508 @@
+Vault Integration with CI/CD
+Objectives
+By the end of this lab, you will be able to:
+
+Install and configure HashiCorp Vault on a Linux system
+Set up a Jenkins CI/CD server and connect it to Vault using the AppRole authentication method
+Build a Jenkins pipeline that retrieves secrets from Vault at build time instead of hardcoding them
+Diagnose and resolve common Vault-Jenkins integration failures using a structured troubleshooting script
+Apply security best practices for handling API keys and sensitive data in CI/CD workflows
+Prerequisites
+Before starting this lab, you should have:
+
+Basic Linux command line skills (package management, systemd, file permissions)
+Familiarity with CI/CD concepts and pipeline stages
+Basic knowledge of JSON/HCL configuration syntax
+Understanding of token-based API authentication
+Experience with Git
+This lab uses a bare Linux machine (Ubuntu 20.04/22.04) with no pre-installed tools. All required software is installed during the lab. The exact install commands are:
+
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y curl wget unzip git jq software-properties-common apt-transport-https ca-certificates gnupg lsb-release netcat-openbsd
+Docker, Vault, and Jenkins are installed in Task 1 with exact commands provided.
+
+Task 1: Install and Initialize Vault, Install Jenkins
+Step 1.1: Install HashiCorp Vault
+# Create directory for Vault
+sudo mkdir -p /opt/vault
+cd /opt/vault
+
+# Download and install Vault
+VAULT_VERSION="1.15.2"
+wget https://releases.hashicorp.com/vault/${VAULT_VERSION}/vault_${VAULT_VERSION}_linux_amd64.zip
+sudo unzip -o vault_${VAULT_VERSION}_linux_amd64.zip
+sudo mv vault /usr/local/bin/
+sudo chmod +x /usr/local/bin/vault
+vault version
+
+# Create vault system user and data directories
+sudo useradd --system --home /etc/vault.d --shell /bin/false vault || true
+sudo mkdir -p /etc/vault.d /opt/vault/data /opt/vault/logs /opt/vault/audit
+sudo chown -R vault:vault /etc/vault.d /opt/vault
+Create the configuration and systemd service:
+
+sudo tee /etc/vault.d/vault.hcl > /dev/null <<EOF
+ui = true
+disable_mlock = true
+
+storage "file" {
+  path = "/opt/vault/data"
+}
+
+listener "tcp" {
+  address     = "0.0.0.0:8200"
+  tls_disable = 1
+}
+
+api_addr = "http://127.0.0.1:8200"
+cluster_addr = "https://127.0.0.1:8201"
+EOF
+
+sudo chown vault:vault /etc/vault.d/vault.hcl
+sudo chmod 640 /etc/vault.d/vault.hcl
+
+sudo tee /etc/systemd/system/vault.service > /dev/null <<EOF
+[Unit]
+Description=HashiCorp Vault
+Requires=network-online.target
+After=network-online.target
+ConditionFileNotEmpty=/etc/vault.d/vault.hcl
+
+[Service]
+Type=notify
+User=vault
+Group=vault
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+SecureBits=keep-caps
+AmbientCapabilities=CAP_IPC_LOCK
+Capabilities=CAP_IPC_LOCK+ep
+CapabilityBoundingSet=CAP_SYSLOG CAP_IPC_LOCK
+NoNewPrivileges=yes
+ExecStart=/usr/local/bin/vault server -config=/etc/vault.d/vault.hcl
+ExecReload=/bin/kill --signal HUP \$MAINPID
+KillMode=process
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable vault
+sudo systemctl start vault
+sudo systemctl status vault --no-pager
+Step 1.2: Initialize, Unseal, and Prepare Secrets
+export VAULT_ADDR='http://127.0.0.1:8200'
+echo 'export VAULT_ADDR="http://127.0.0.1:8200"' >> ~/.bashrc
+
+cd /opt/vault
+vault operator init -key-shares=5 -key-threshold=3 > vault-init.txt
+cat vault-init.txt
+
+UNSEAL_KEY_1=$(grep 'Unseal Key 1:' vault-init.txt | awk '{print $4}')
+UNSEAL_KEY_2=$(grep 'Unseal Key 2:' vault-init.txt | awk '{print $4}')
+UNSEAL_KEY_3=$(grep 'Unseal Key 3:' vault-init.txt | awk '{print $4}')
+ROOT_TOKEN=$(grep 'Initial Root Token:' vault-init.txt | awk '{print $4}')
+
+vault operator unseal $UNSEAL_KEY_1
+vault operator unseal $UNSEAL_KEY_2
+vault operator unseal $UNSEAL_KEY_3
+
+export VAULT_TOKEN=$ROOT_TOKEN
+echo "export VAULT_TOKEN=$ROOT_TOKEN" >> ~/.bashrc
+
+vault status
+Enable the KV v2 secrets engine and store sample CI/CD secrets:
+
+vault secrets enable -path=secret kv-v2
+
+vault kv put secret/ci-cd/api-keys \
+    github_token="ghp_example_github_token_12345" \
+    docker_registry_password="docker_password_example" \
+    database_password="db_secret_password_123"
+
+vault kv put secret/ci-cd/app-config \
+    app_secret_key="super_secret_app_key_456" \
+    jwt_secret="jwt_signing_secret_abc"
+
+vault kv get secret/ci-cd/api-keys
+Enable audit logging so later troubleshooting has evidence to inspect:
+
+sudo chown vault:vault /opt/vault/audit
+vault audit enable file file_path=/opt/vault/audit/vault-audit.log
+vault kv get secret/ci-cd/api-keys
+sudo tail -n 5 /opt/vault/audit/vault-audit.log
+Step 1.3: Install Jenkins
+sudo apt install -y openjdk-11-jdk
+java -version
+
+curl -fsSL https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key | sudo tee /usr/share/keyrings/jenkins-keyring.asc > /dev/null
+echo deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] https://pkg.jenkins.io/debian-stable binary/ | sudo tee /etc/apt/sources.list.d/jenkins.list > /dev/null
+
+sudo apt update
+sudo apt install -y jenkins
+
+sudo systemctl start jenkins
+sudo systemctl enable jenkins
+sudo systemctl status jenkins --no-pager
+
+sudo cat /var/lib/jenkins/secrets/initialAdminPassword
+Complete the setup wizard at http://localhost:8080:
+
+Paste the initial admin password.
+Choose Install suggested plugins.
+Create an admin user.
+Confirm the Jenkins URL as http://localhost:8080/.
+Then install the Vault plugin:
+
+Go to Manage Jenkins > Plugins > Available plugins.
+Search for HashiCorp Vault Plugin and install it (this pulls in the Credentials Binding dependency automatically).
+Restart Jenkins when prompted.
+Deliverable for Task 1: Run vault status (should show Sealed: false, Initialized: true) and sudo systemctl is-active jenkins (should print active). Take a screenshot or copy the terminal output of both commands â this is your evidence that the base platform is ready.
+
+Task 2: Configure AppRole Auth and Build a Vault-Aware Pipeline
+Step 2.1: Create the Jenkins AppRole and Policy
+vault auth enable approle
+
+vault policy write jenkins-policy - <<EOF
+path "secret/data/ci-cd/*" {
+  capabilities = ["read"]
+}
+path "secret/metadata/ci-cd/*" {
+  capabilities = ["list", "read"]
+}
+EOF
+
+vault write auth/approle/role/jenkins \
+    token_policies="jenkins-policy" \
+    token_ttl=1h \
+    token_max_ttl=4h \
+    bind_secret_id=true
+
+ROLE_ID=$(vault read -field=role_id auth/approle/role/jenkins/role-id)
+SECRET_ID=$(vault write -field=secret_id -f auth/approle/role/jenkins/secret-id)
+
+echo "ROLE_ID=$ROLE_ID"  | tee ~/jenkins-vault-creds.txt
+echo "SECRET_ID=$SECRET_ID" | tee -a ~/jenkins-vault-creds.txt
+Register the credential in Jenkins:
+
+Manage Jenkins > Credentials > (global) > Add Credentials.
+Kind: Vault App Role Credential.
+Role ID: value of $ROLE_ID. Secret ID: value of $SECRET_ID. Path: approle. ID: vault-approle.
+Save.
+Manage Jenkins > System, scroll to Vault Plugin, set Vault URL to http://127.0.0.1:8200, and select the vault-approle credential as the default. Save.
+Step 2.2: Create the Pipeline Job
+Create a small sample app and a Jenkinsfile that pulls secrets from Vault instead of hardcoding them:
+
+mkdir -p ~/sample-app
+cd ~/sample-app
+git init
+
+cat > package.json <<'EOF'
+{
+  "name": "vault-cicd-demo",
+  "version": "1.0.0",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js",
+    "test": "echo 'Running tests...' && exit 0"
+  }
+}
+EOF
+
+cat > Jenkinsfile <<'EOF'
+pipeline {
+    agent any
+
+    stages {
+        stage('Checkout') {
+            steps {
+                echo 'Checking out code...'
+            }
+        }
+
+        stage('Load Secrets from Vault') {
+            steps {
+                script {
+                    def secrets = [
+                        [path: 'secret/ci-cd/api-keys', engineVersion: 2, secretValues: [
+                            [envVar: 'GITHUB_TOKEN', vaultKey: 'github_token'],
+                            [envVar: 'DATABASE_PASSWORD', vaultKey: 'database_password']
+                        ]],
+                        [path: 'secret/ci-cd/app-config', engineVersion: 2, secretValues: [
+                            [envVar: 'JWT_SECRET', vaultKey: 'jwt_secret']
+                        ]]
+                    ]
+                    withVault([configuration: [timeout: 60, vaultCredentialId: 'vault-approle', vaultUrl: 'http://127.0.0.1:8200'], vaultSecrets: secrets]) {
+                        sh '''
+                            echo "Secrets loaded successfully"
+                            echo "GitHub token length: ${#GITHUB_TOKEN}"
+                            echo "DB password length: ${#DATABASE_PASSWORD}"
+                            echo "JWT secret length: ${#JWT_SECRET}"
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Build and Test') {
+            steps {
+                sh 'echo "Build step placeholder" && npm test'
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Pipeline succeeded - secrets were never printed in plaintext'
+        }
+        failure {
+            echo 'Pipeline failed - see console output for the failing stage'
+        }
+    }
+}
+EOF
+
+git add .
+git commit -m "Initial commit with Vault-integrated pipeline"
+In Jenkins:
+
+New Item > Pipeline, name it vault-cicd-demo.
+Under Pipeline, choose Pipeline script and paste the contents of the Jenkinsfile above.
+Save, then click Build Now.
+Deliverable for Task 2: Open the build's Console Output and confirm you see the three "length" lines printed with non-zero numbers, and that no raw secret value appears anywhere in the log (only lengths). This confirms Vault is correctly injecting secrets as masked environment variables. Save the console output to a text file named build-console-output.txt.
+
+Task 3: Diagnose Integration Failures with a Troubleshooting Script
+Integrations like this fail in predictable ways: Vault sealed, wrong policy, expired AppRole secret ID, Jenkins credential misconfigured, or the plugin pointed at the wrong URL. In this task you will build and use a complete diagnostic script covering each failure mode.
+
+Step 3.1: Break the Integration on Purpose
+To validate your troubleshooting script actually detects problems, deliberately break the setup once:
+
+# Generate a fresh secret ID and immediately revoke it to simulate an expired credential
+vault write -f auth/approle/role/jenkins/secret-id-accessor/destroy \
+    secret_id_accessor="$(vault list -format=json auth/approle/role/jenkins/secret-id | jq -r '.[0]')" || true
+
+# Confirm the policy still exists but check what happens with a bad path
+vault kv get secret/ci-cd/does-not-exist || echo "Expected failure: path does not exist"
+Note the error output from the last command â you will recognize this exact failure pattern in your script's output later.
+
+Step 3.2: Build the Complete Troubleshooting Script
+Create the full diagnostic script below exactly as shown. It checks Vault connectivity, Jenkins connectivity, the Jenkins AppRole policy, and end-to-end secret retrieval, then prints a summary.
+
+cat > ~/troubleshoot-vault-jenkins.sh <<'SCRIPT'
+#!/bin/bash
+#
+# troubleshoot-vault-jenkins.sh
+# Diagnoses common failure points in a Vault + Jenkins CI/CD integration.
+
+set -uo pipefail
+
+VAULT_ADDR="${VAULT_ADDR:-http://127.0.0.1:8200}"
+JENKINS_URL="${JENKINS_URL:-http://127.0.0.1:8080}"
+POLICY_NAME="jenkins-policy"
+ROLE_NAME="jenkins"
+SECRET_PATH="secret/data/ci-cd/api-keys"
+
+PASS_COUNT=0
+FAIL_COUNT=0
+
+pass() { echo "   [PASS] $1"; PASS_COUNT=$((PASS_COUNT+1)); }
+fail() { echo "   [FAIL] $1"; FAIL_COUNT=$((FAIL_COUNT+1)); }
+
+# 1. Checks that the Vault API is reachable and unsealed.
+check_vault_connectivity() {
+    echo "1. Checking Vault connectivity..."
+    local health_json
+    health_json=$(curl -s "${VAULT_ADDR}/v1/sys/health")
+
+    if [ -z "$health_json" ]; then
+        fail "Cannot reach Vault at ${VAULT_ADDR}. Is the vault.service running?"
+        echo "        Suggested fix: sudo systemctl status vault && sudo systemctl start vault"
+        return 1
+    fi
+
+    local sealed
+    sealed=$(echo "$health_json" | jq -r '.sealed // empty')
+
+    if [ "$sealed" == "true" ]; then
+        fail "Vault is sealed."
+        echo "        Suggested fix: vault operator unseal <key> (repeat until threshold met)"
+        return 1
+    elif [ "$sealed" == "false" ]; then
+        pass "Vault is reachable and unsealed at ${VAULT_ADDR}"
+        return 0
+    else
+        fail "Unexpected response from Vault health endpoint: $health_json"
+        echo "        Suggested fix: verify VAULT_ADDR is correct and vault.hcl listener config is valid"
+        return 1
+    fi
+}
+
+# 2. Checks that the Jenkins web UI/API is reachable and returns a valid response.
+check_jenkins_connectivity() {
+    echo "2. Checking Jenkins connectivity..."
+    local http_code
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" "${JENKINS_URL}/login")
+
+    if [ "$http_code" == "200" ] || [ "$http_code" == "403" ]; then
+        pass "Jenkins is reachable at ${JENKINS_URL} (HTTP $http_code)"
+        return 0
+    else
+        fail "Jenkins did not respond as expected at ${JENKINS_URL} (HTTP $http_code)"
+        echo "        Suggested fix: sudo systemctl status jenkins && sudo systemctl restart jenkins"
+        echo "        Also confirm port 8080 is not blocked: sudo ss -ltnp | grep 8080"
+        return 1
+    fi
+}
+
+# 3. Checks that the jenkins-policy exists in Vault and grants read access to the CI/CD path.
+check_vault_policy() {
+    echo "3. Checking Vault policy for Jenkins..."
+
+    if ! command -v vault >/dev/null 2>&1; then
+        fail "vault CLI not found on PATH"
+        echo "        Suggested fix: ensure /usr/local/bin/vault is installed and on PATH"
+        return 1
+    fi
+
+    local policy_output
+    policy_output=$(vault policy read "$POLICY_NAME" 2>&1)
+
+    if [ $? -ne 0 ]; then
+        fail "Policy '${POLICY_NAME}' does not exist or Vault is not authenticated."
+        echo "        Suggested fix: re-create it with: vault policy write ${POLICY_NAME} <policy-file>"
+        echo "        Also check: export VAULT_TOKEN=<root or admin token>"
+        return 1
+    fi
+
+    if echo "$policy_output" | grep -q "secret/data/ci-cd"; then
+        pass "Policy '${POLICY_NAME}' grants access to secret/data/ci-cd/*"
+    else
+        fail "Policy '${POLICY_NAME}' exists but does not reference secret/data/ci-cd/*"
+        echo "        Suggested fix: rewrite the policy to include:"
+        echo '        path "secret/data/ci-cd/*" { capabilities = ["read"] }'
+        return 1
+    fi
+
+    local role_output
+    role_output=$(vault read -format=json "auth/approle/role/${ROLE_NAME}" 2>&1)
+
+    if [ $? -ne 0 ]; then
+        fail "AppRole '${ROLE_NAME}' does not exist under auth/approle."
+        echo "        Suggested fix: vault write auth/approle/role/${ROLE_NAME} token_policies=${POLICY_NAME} bind_secret_id=true"
+        return 1
+    fi
+
+    local bound_policy
+    bound_policy=$(echo "$role_output" | jq -r '.data.token_policies[]?' 2>/dev/null | grep -x "$POLICY_NAME")
+
+    if [ -n "$bound_policy" ]; then
+        pass "AppRole '${ROLE_NAME}' is correctly bound to policy '${POLICY_NAME}'"
+        return 0
+    else
+        fail "AppRole '${ROLE_NAME}' exists but is not bound to '${POLICY_NAME}'"
+        echo "        Suggested fix: vault write auth/approle/role/${ROLE_NAME} token_policies=${POLICY_NAME}"
+        return 1
+    fi
+}
+
+# 4. Performs an end-to-end secret retrieval using AppRole login, exactly as Jenkins would.
+test_secret_retrieval() {
+    echo "4. Testing end-to-end secret retrieval via AppRole..."
+
+    local role_id secret_id
+    role_id=$(vault read -field=role_id "auth/approle/role/${ROLE_NAME}/role-id" 2>/dev/null)
+
+    if [ -z "$role_id" ]; then
+        fail "Could not read role-id for AppRole '${ROLE_NAME}'"
+        echo "        Suggested fix: confirm the AppRole exists (see check_vault_policy output above)"
+        return 1
+    fi
+
+    secret_id=$(vault write -field=secret_id -f "auth/approle/role/${ROLE_NAME}/secret-id" 2>/dev/null)
+
+    if [ -z "$secret_id" ]; then
+        fail "Could not generate a secret-id for AppRole '${ROLE_NAME}'"
+        echo "        Suggested fix: check bind_secret_id=true is set on the role"
+        return 1
+    fi
+
+    local login_response client_token
+    login_response=$(curl -s --request POST \
+        --data "{\"role_id\":\"${role_id}\",\"secret_id\":\"${secret_id}\"}" \
+        "${VAULT_ADDR}/v1/auth/approle/login")
+
+    client_token=$(echo "$login_response" | jq -r '.auth.client_token // empty')
+
+    if [ -z "$client_token" ]; then
+        fail "AppRole login failed. Response: $login_response"
+        echo "        Suggested fix: verify role_id/secret_id pair and that the approle auth method is enabled"
+        return 1
+    fi
+
+    pass "AppRole login succeeded, received a client token"
+
+    local secret_response secret_value
+    secret_response=$(curl -s --header "X-Vault-Token: ${client_token}" \
+        "${VAULT_ADDR}/v1/${SECRET_PATH}")
+
+    secret_value=$(echo "$secret_response" | jq -r '.data.data.github_token // empty')
+
+    if [ -n "$secret_value" ]; then
+        pass "Successfully retrieved secret from ${SECRET_PATH} using the Jenkins AppRole token"
+        return 0
+    else
+        fail "Could not retrieve secret data from ${SECRET_PATH}. Response: $secret_response"
+        echo "        Suggested fix: confirm the secret exists (vault kv get ${SECRET_PATH#secret/data/}) and the policy path matches exactly"
+        return 1
+    fi
+}
+
+echo "=== Vault-Jenkins Integration Troubleshooting ==="
+echo "Vault Address:   ${VAULT_ADDR}"
+echo "Jenkins Address: ${JENKINS_URL}"
+echo
+
+check_vault_connectivity
+echo
+check_jenkins_connectivity
+echo
+check_vault_policy
+echo
+test_secret_retrieval
+echo
+
+echo "=== Summary ==="
+echo "Checks passed: ${PASS_COUNT}"
+echo "Checks failed: ${FAIL_COUNT}"
+
+if [ "$FAIL_COUNT" -eq 0 ]; then
+    echo "Result: Integration is healthy."
+    exit 0
+else
+    echo "Result: ${FAIL_COUNT} issue(s) found. Review the suggested fixes above."
+    exit 1
+fi
+SCRIPT
+
+chmod +x ~/troubleshoot-vault-jenkins.sh
+Run it against your working environment:
+
+~/troubleshoot-vault-jenkins.sh
+Deliverable for Task 3: Capture the full output of the script into a file:
+
+~/troubleshoot-vault-jenkins.sh | tee ~/troubleshoot-output.txt
+You should see four checks, each printing [PASS] (assuming you re-created a valid secret-id after the deliberate breakage in Step 3.1), and a final Summary block reporting Checks passed: 4 and Checks failed: 0, with exit code 0. If any check reports [FAIL], apply the suggested fix printed directly beneath it, re-run the script, and confirm it turns to [PASS] before moving on. Save ~/troubleshoot-output.txt as your final evidence file for this task.
+
+Expected Outcomes
+A running Vault server (unsealed, KV v2 enabled) integrated with a running Jenkins server via AppRole authentication
+A Jenkins pipeline that retrieves secrets from Vault at runtime and never exposes them in plaintext in the build log
+A reusable troubleshooting script that can independently diagnose Vault connectivity, Jenkins connectivity, policy misconfiguration, and end-to-end secret retrieval failures
+Conclusion
+In this lab you built a complete Vault-to-Jenkins secrets pipeline from the ground up: installing and unsealing HashiCorp Vault, enabling the KV v2 secrets engine, installing Jenkins and its Vault plugin, and binding the two systems together with AppRole authentication and a least-privilege policy. You then proved the integration worked by running a real Jenkins pipeline that pulled GitHub, database, and JWT secrets out of Vault at build time and confirmed through the console output that only secret lengths were logged, never plaintext values. Finally, you built and exercised a four-stage diagnostic script that checks Vault connectivity, Jenkins connectivity, policy and AppRole bindings, and end-to-end secret retrieval, giving you a repeatable tool for diagnosing this class of integration in any future environment. The key takeaway is that secrets management in CI/CD is not just about storing values securely, it is about designing the authentication boundary (AppRole, scoped policies, short TTLs) so that a compromised pipeline can only ever reach the exact secrets it needs. From here, natural next steps include enabling Vault's database secrets engine for fully dynamic, auto-expiring database credentials, adding TLS to the Vault listener instead of running in tls_disable mode, and wiring the rotation and multi-environment policy patterns from this lab into a real multi-branch Jenkins pipeline.
