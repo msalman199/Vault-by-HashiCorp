@@ -1,0 +1,553 @@
+Vault Auditing
+Lab Objectives
+By the end of this lab, students will be able to:
+
+Understand the importance of audit logging in HashiCorp Vault
+Enable and configure audit logging mechanisms in Vault
+Generate audit events through various Vault operations
+Analyze audit logs to monitor secret access and security events
+Interpret audit log entries to track user activities and system events
+Implement best practices for audit log management and security
+Prerequisites
+Before starting this lab, students should have:
+
+Basic understanding of Linux command line operations
+Familiarity with HashiCorp Vault concepts from previous labs
+Knowledge of JSON format and basic log analysis
+Understanding of file permissions and directory structures in Linux
+Basic text processing skills using common Linux utilities
+Lab Environment Setup
+Note: Al Nafi provides Linux-based cloud machines for this lab. Simply click "Start Lab" to access your dedicated Linux machine. The provided machine is bare metal with no pre-installed tools, so you will need to install HashiCorp Vault and other required tools during this lab.
+
+Task 1: Install and Configure HashiCorp Vault
+Subtask 1.1: Install HashiCorp Vault
+First, we need to install HashiCorp Vault on our Linux machine.
+
+# Update the system packages
+sudo apt update
+
+# Install required dependencies
+sudo apt install -y wget unzip curl
+
+# Download HashiCorp Vault
+wget https://releases.hashicorp.com/vault/1.15.2/vault_1.15.2_linux_amd64.zip
+
+# Unzip the downloaded file
+unzip vault_1.15.2_linux_amd64.zip
+
+# Move vault binary to system path
+sudo mv vault /usr/local/bin/
+
+# Verify installation
+vault version
+Subtask 1.2: Create Vault Configuration Directory
+# Create directory for Vault configuration
+sudo mkdir -p /etc/vault
+
+# Create directory for Vault data
+sudo mkdir -p /opt/vault/data
+
+# Create directory for audit logs
+sudo mkdir -p /var/log/vault
+
+# Set appropriate permissions
+sudo chmod 755 /etc/vault
+sudo chmod 755 /opt/vault/data
+sudo chmod 755 /var/log/vault
+Subtask 1.3: Create Vault Configuration File
+# Create Vault configuration file
+sudo tee /etc/vault/vault.hcl > /dev/null <<EOF
+storage "file" {
+  path = "/opt/vault/data"
+}
+
+listener "tcp" {
+  address     = "127.0.0.1:8200"
+  tls_disable = 1
+}
+
+api_addr = "http://127.0.0.1:8200"
+cluster_addr = "https://127.0.0.1:8201"
+ui = true
+EOF
+Subtask 1.4: Start Vault Server
+# Start Vault server in development mode for this lab
+vault server -config=/etc/vault/vault.hcl &
+
+# Wait for server to start
+sleep 5
+
+# Set Vault address environment variable
+export VAULT_ADDR='http://127.0.0.1:8200'
+
+# Check server status
+vault status
+Subtask 1.5: Initialize and Unseal Vault
+# Initialize Vault (save the output securely)
+vault operator init -key-shares=1 -key-threshold=1 > vault_keys.txt
+
+# Extract unseal key and root token
+UNSEAL_KEY=$(grep 'Unseal Key 1:' vault_keys.txt | awk '{print $NF}')
+ROOT_TOKEN=$(grep 'Initial Root Token:' vault_keys.txt | awk '{print $NF}')
+
+# Unseal Vault
+vault operator unseal $UNSEAL_KEY
+
+# Authenticate with root token
+vault auth $ROOT_TOKEN
+
+# Verify Vault is ready
+vault status
+Task 2: Enable and Configure Audit Logging
+Subtask 2.1: Understanding Vault Audit Devices
+Vault supports multiple audit devices that can be enabled simultaneously:
+
+File audit device: Writes audit logs to a file
+Syslog audit device: Sends audit logs to syslog
+Socket audit device: Writes audit logs to a TCP/UDP socket
+Subtask 2.2: Enable File Audit Device
+# Enable file audit device
+vault audit enable file file_path=/var/log/vault/audit.log
+
+# Verify audit device is enabled
+vault audit list
+
+# Check the audit log file was created
+ls -la /var/log/vault/
+Subtask 2.3: Enable Syslog Audit Device
+# Enable syslog audit device as a secondary audit method
+vault audit enable -path="syslog_audit" syslog facility=LOCAL0 tag=vault
+
+# Verify both audit devices are enabled
+vault audit list
+Subtask 2.4: Test Audit Logging
+# Perform some operations to generate audit events
+vault secrets enable -path=secret kv
+
+# Create a test secret
+vault kv put secret/test-secret username=testuser password=testpass
+
+# Read the secret
+vault kv get secret/test-secret
+
+# List secrets
+vault kv list secret/
+
+# Check if audit events were logged
+tail -5 /var/log/vault/audit.log
+Task 3: Generate Various Audit Events
+Subtask 3.1: Authentication Events
+# Create a new authentication method
+vault auth enable userpass
+
+# Create a user
+vault write auth/userpass/users/alice password=mypassword policies=default
+
+# Authenticate as the new user (this will generate auth events)
+vault auth -method=userpass username=alice password=mypassword
+
+# Save the new token for later use
+ALICE_TOKEN=$(vault auth -method=userpass username=alice password=mypassword -format=json | jq -r '.auth.client_token')
+
+# Switch back to root token
+vault auth $ROOT_TOKEN
+Subtask 3.2: Policy and Authorization Events
+# Create a custom policy
+vault policy write alice-policy - <<EOF
+path "secret/alice/*" {
+  capabilities = ["create", "read", "update", "delete", "list"]
+}
+
+path "secret/shared/*" {
+  capabilities = ["read", "list"]
+}
+EOF
+
+# Update user with new policy
+vault write auth/userpass/users/alice policies=alice-policy
+
+# Test policy enforcement (this will generate authorization events)
+VAULT_TOKEN=$ALICE_TOKEN vault kv put secret/alice/personal key=value
+
+# Try to access unauthorized path (will generate denial event)
+VAULT_TOKEN=$ALICE_TOKEN vault kv put secret/admin/config key=value || echo "Access denied as expected"
+Subtask 3.3: Secret Engine Operations
+# Switch back to root token
+vault auth $ROOT_TOKEN
+
+# Enable different secret engines to generate various events
+vault secrets enable -path=database database
+vault secrets enable -path=transit transit
+
+# Create encryption key in transit engine
+vault write -f transit/keys/my-key
+
+# Encrypt some data
+vault write transit/encrypt/my-key plaintext=$(base64 <<< "Hello World")
+
+# Generate database credentials (configure a simple connection)
+vault write database/config/my-db \
+    plugin_name=mysql-database-plugin \
+    connection_url="{{username}}:{{password}}@tcp(localhost:3306)/" \
+    allowed_roles="my-role" \
+    username="root" \
+    password="mypassword" || echo "Database not available, but event logged"
+Task 4: Analyze Audit Logs
+Subtask 4.1: Understanding Audit Log Structure
+# Display the structure of audit log entries
+echo "Sample audit log entries:"
+head -3 /var/log/vault/audit.log | jq '.'
+
+# Count total audit events
+echo "Total audit events:"
+wc -l /var/log/vault/audit.log
+Subtask 4.2: Filter and Analyze Authentication Events
+# Install jq for JSON processing if not available
+sudo apt install -y jq
+
+# Filter authentication events
+echo "Authentication events:"
+grep '"type":"request"' /var/log/vault/audit.log | grep '"path":"auth/' | jq -r '.time + " " + .request.path + " " + .auth.display_name'
+
+# Count successful vs failed authentication attempts
+echo "Successful authentications:"
+grep '"type":"response"' /var/log/vault/audit.log | grep '"path":"auth/' | grep '"error":""' | wc -l
+
+echo "Failed authentications:"
+grep '"type":"response"' /var/log/vault/audit.log | grep '"path":"auth/' | grep -v '"error":""' | wc -l
+Subtask 4.3: Monitor Secret Access Patterns
+# Track secret read operations
+echo "Secret read operations:"
+grep '"type":"request"' /var/log/vault/audit.log | grep '"operation":"read"' | jq -r '.time + " " + .request.path + " " + (.auth.display_name // "unknown")'
+
+# Track secret write operations
+echo "Secret write operations:"
+grep '"type":"request"' /var/log/vault/audit.log | grep '"operation":"create\|update"' | jq -r '.time + " " + .request.path + " " + (.auth.display_name // "unknown")'
+
+# Find most accessed secrets
+echo "Most accessed secret paths:"
+grep '"type":"request"' /var/log/vault/audit.log | jq -r '.request.path' | grep '^secret/' | sort | uniq -c | sort -nr
+Subtask 4.4: Identify Security Events
+# Find denied operations
+echo "Denied operations (potential security events):"
+grep '"type":"response"' /var/log/vault/audit.log | grep '"error"' | grep -v '"error":""' | jq -r '.time + " " + .request.path + " " + .error'
+
+# Track policy violations
+echo "Policy violations:"
+grep 'permission denied' /var/log/vault/audit.log | jq -r '.time + " " + .request.path + " " + (.auth.display_name // "unknown")'
+
+# Monitor unusual access patterns
+echo "Operations by user:"
+grep '"type":"request"' /var/log/vault/audit.log | jq -r '(.auth.display_name // "unknown")' | sort | uniq -c | sort -nr
+Subtask 4.5: Create Audit Analysis Scripts
+# Create a script for daily audit analysis
+cat > audit_analysis.sh << 'EOF'
+#!/bin/bash
+
+AUDIT_LOG="/var/log/vault/audit.log"
+DATE=$(date +%Y-%m-%d)
+
+echo "=== Vault Audit Analysis for $DATE ==="
+echo
+
+echo "1. Total Events Today:"
+grep "$(date +%Y-%m-%d)" $AUDIT_LOG | wc -l
+
+echo
+echo "2. Authentication Summary:"
+echo "   Successful logins:"
+grep "$(date +%Y-%m-%d)" $AUDIT_LOG | grep '"type":"response"' | grep '"path":"auth/' | grep '"error":""' | wc -l
+echo "   Failed logins:"
+grep "$(date +%Y-%m-%d)" $AUDIT_LOG | grep '"type":"response"' | grep '"path":"auth/' | grep -v '"error":""' | wc -l
+
+echo
+echo "3. Top 5 Most Active Users:"
+grep "$(date +%Y-%m-%d)" $AUDIT_LOG | grep '"type":"request"' | jq -r '(.auth.display_name // "unknown")' | sort | uniq -c | sort -nr | head -5
+
+echo
+echo "4. Security Alerts (Denied Operations):"
+grep "$(date +%Y-%m-%d)" $AUDIT_LOG | grep '"type":"response"' | grep '"error"' | grep -v '"error":""' | wc -l
+
+echo
+echo "5. Most Accessed Secrets:"
+grep "$(date +%Y-%m-%d)" $AUDIT_LOG | grep '"type":"request"' | jq -r '.request.path' | grep '^secret/' | sort | uniq -c | sort -nr | head -5
+
+EOF
+
+# Make the script executable
+chmod +x audit_analysis.sh
+
+# Run the analysis script
+./audit_analysis.sh
+Task 5: Advanced Audit Log Management
+Subtask 5.1: Log Rotation Configuration
+# Create logrotate configuration for Vault audit logs
+sudo tee /etc/logrotate.d/vault << EOF
+/var/log/vault/audit.log {
+    daily
+    missingok
+    rotate 30
+    compress
+    delaycompress
+    notifempty
+    copytruncate
+    postrotate
+        # Send HUP signal to Vault to reopen log files
+        pkill -HUP vault || true
+    endscript
+}
+EOF
+
+# Test logrotate configuration
+sudo logrotate -d /etc/logrotate.d/vault
+Subtask 5.2: Real-time Monitoring Setup
+# Create a real-time monitoring script
+cat > monitor_audit.sh << 'EOF'
+#!/bin/bash
+
+AUDIT_LOG="/var/log/vault/audit.log"
+
+echo "Starting real-time Vault audit monitoring..."
+echo "Press Ctrl+C to stop"
+echo
+
+tail -f $AUDIT_LOG | while read line; do
+    # Parse the JSON line
+    echo "$line" | jq -r '
+        if .error and .error != "" then
+            "\(.time) [ERROR] \(.request.path) - \(.error) (User: \(.auth.display_name // "unknown"))"
+        elif .type == "request" and .request.operation == "read" and (.request.path | startswith("secret/")) then
+            "\(.time) [SECRET_ACCESS] \(.request.path) (User: \(.auth.display_name // "unknown"))"
+        elif .type == "response" and (.request.path | startswith("auth/")) and .error == "" then
+            "\(.time) [LOGIN] Successful authentication for \(.auth.display_name // "unknown")"
+        else
+            empty
+        end
+    ' 2>/dev/null | grep -v '^$'
+done
+EOF
+
+chmod +x monitor_audit.sh
+
+# Start monitoring in background for demonstration
+echo "Starting audit monitoring (will run for 30 seconds)..."
+timeout 30s ./monitor_audit.sh &
+MONITOR_PID=$!
+
+# Generate some events to see in the monitor
+sleep 2
+vault kv get secret/test-secret
+VAULT_TOKEN=$ALICE_TOKEN vault kv get secret/alice/personal
+VAULT_TOKEN=$ALICE_TOKEN vault kv put secret/admin/test key=value || true
+
+# Wait for monitoring to complete
+wait $MONITOR_PID 2>/dev/null || true
+echo "Monitoring demonstration completed."
+Subtask 5.3: Audit Log Backup and Archival
+# Create backup directory
+sudo mkdir -p /backup/vault/audit
+
+# Create backup script
+cat > backup_audit_logs.sh << 'EOF'
+#!/bin/bash
+
+BACKUP_DIR="/backup/vault/audit"
+AUDIT_LOG="/var/log/vault/audit.log"
+DATE=$(date +%Y%m%d_%H%M%S)
+
+# Create compressed backup
+gzip -c $AUDIT_LOG > $BACKUP_DIR/audit_log_$DATE.gz
+
+# Keep only last 7 days of backups
+find $BACKUP_DIR -name "audit_log_*.gz" -mtime +7 -delete
+
+echo "Audit log backed up to $BACKUP_DIR/audit_log_$DATE.gz"
+EOF
+
+chmod +x backup_audit_logs.sh
+
+# Run backup
+./backup_audit_logs.sh
+
+# Verify backup
+ls -la /backup/vault/audit/
+Task 6: Audit Log Security and Compliance
+Subtask 6.1: Secure Audit Log Permissions
+# Set secure permissions on audit logs
+sudo chmod 640 /var/log/vault/audit.log
+sudo chown root:vault /var/log/vault/audit.log || sudo chown root:root /var/log/vault/audit.log
+
+# Verify permissions
+ls -la /var/log/vault/audit.log
+
+# Create audit log integrity check
+cat > check_audit_integrity.sh << 'EOF'
+#!/bin/bash
+
+AUDIT_LOG="/var/log/vault/audit.log"
+CHECKSUM_FILE="/var/log/vault/audit.log.sha256"
+
+# Generate checksum
+sha256sum $AUDIT_LOG > $CHECKSUM_FILE.new
+
+# Compare with previous checksum if exists
+if [ -f $CHECKSUM_FILE ]; then
+    if ! diff $CHECKSUM_FILE $CHECKSUM_FILE.new > /dev/null; then
+        echo "WARNING: Audit log checksum changed!"
+        echo "Previous: $(cat $CHECKSUM_FILE)"
+        echo "Current:  $(cat $CHECKSUM_FILE.new)"
+    else
+        echo "Audit log integrity verified"
+    fi
+else
+    echo "Initial checksum created"
+fi
+
+mv $CHECKSUM_FILE.new $CHECKSUM_FILE
+EOF
+
+chmod +x check_audit_integrity.sh
+./check_audit_integrity.sh
+Subtask 6.2: Compliance Reporting
+# Create compliance report generator
+cat > compliance_report.sh << 'EOF'
+#!/bin/bash
+
+AUDIT_LOG="/var/log/vault/audit.log"
+REPORT_DATE=$(date +%Y-%m-%d)
+REPORT_FILE="vault_compliance_report_$REPORT_DATE.txt"
+
+cat > $REPORT_FILE << EOL
+VAULT AUDIT COMPLIANCE REPORT
+Generated: $(date)
+Report Period: $REPORT_DATE
+
+=== SUMMARY STATISTICS ===
+Total Events: $(wc -l < $AUDIT_LOG)
+Authentication Events: $(grep '"path":"auth/' $AUDIT_LOG | wc -l)
+Secret Access Events: $(grep '"path":"secret/' $AUDIT_LOG | wc -l)
+Policy Violations: $(grep 'permission denied' $AUDIT_LOG | wc -l)
+
+=== USER ACTIVITY ===
+EOL
+
+echo "Active Users:" >> $REPORT_FILE
+grep '"type":"request"' $AUDIT_LOG | jq -r '(.auth.display_name // "unknown")' | sort | uniq -c | sort -nr >> $REPORT_FILE
+
+echo "" >> $REPORT_FILE
+echo "=== SECURITY EVENTS ===" >> $REPORT_FILE
+echo "Failed Authentication Attempts:" >> $REPORT_FILE
+grep '"type":"response"' $AUDIT_LOG | grep '"path":"auth/' | grep -v '"error":""' | jq -r '.time + " " + (.auth.display_name // "unknown") + " " + .error' >> $REPORT_FILE
+
+echo "" >> $REPORT_FILE
+echo "=== ACCESS PATTERNS ===" >> $REPORT_FILE
+echo "Most Accessed Secrets:" >> $REPORT_FILE
+grep '"type":"request"' $AUDIT_LOG | jq -r '.request.path' | grep '^secret/' | sort | uniq -c | sort -nr | head -10 >> $REPORT_FILE
+
+echo "Compliance report generated: $REPORT_FILE"
+EOF
+
+chmod +x compliance_report.sh
+./compliance_report.sh
+
+# Display the report
+cat vault_compliance_report_*.txt
+Task 7: Troubleshooting and Best Practices
+Subtask 7.1: Common Audit Issues and Solutions
+# Check audit device health
+vault audit list -detailed
+
+# Verify audit log file permissions and accessibility
+ls -la /var/log/vault/audit.log
+
+# Test audit device functionality
+echo "Testing audit device..."
+vault kv put secret/audit-test message="audit test $(date)"
+tail -1 /var/log/vault/audit.log | jq '.'
+
+# Check for audit device failures
+vault status | grep -i audit || echo "No audit status issues found"
+Subtask 7.2: Performance Monitoring
+# Monitor audit log size and growth
+echo "Audit log statistics:"
+echo "File size: $(du -h /var/log/vault/audit.log | cut -f1)"
+echo "Line count: $(wc -l < /var/log/vault/audit.log)"
+echo "Growth rate (approximate events per minute in last 100 lines):"
+
+# Calculate recent activity
+tail -100 /var/log/vault/audit.log | jq -r '.time' | head -1 > /tmp/start_time
+tail -100 /var/log/vault/audit.log | jq -r '.time' | tail -1 > /tmp/end_time
+
+echo "Recent activity period: $(cat /tmp/start_time) to $(cat /tmp/end_time)"
+Subtask 7.3: Audit Best Practices Implementation
+# Create audit configuration validation script
+cat > validate_audit_config.sh << 'EOF'
+#!/bin/bash
+
+echo "=== Vault Audit Configuration Validation ==="
+
+# Check if audit devices are enabled
+echo "1. Checking audit devices..."
+if vault audit list | grep -q "file"; then
+    echo "   ✓ File audit device enabled"
+else
+    echo "   ✗ File audit device not enabled"
+fi
+
+# Check audit log file permissions
+echo "2. Checking audit log permissions..."
+if [ -f "/var/log/vault/audit.log" ]; then
+    PERMS=$(stat -c "%a" /var/log/vault/audit.log)
+    if [ "$PERMS" = "640" ] || [ "$PERMS" = "600" ]; then
+        echo "   ✓ Audit log permissions are secure ($PERMS)"
+    else
+        echo "   ⚠ Audit log permissions should be more restrictive (current: $PERMS)"
+    fi
+else
+    echo "   ✗ Audit log file not found"
+fi
+
+# Check log rotation configuration
+echo "3. Checking log rotation..."
+if [ -f "/etc/logrotate.d/vault" ]; then
+    echo "   ✓ Log rotation configured"
+else
+    echo "   ⚠ Log rotation not configured"
+fi
+
+# Check backup procedures
+echo "4. Checking backup procedures..."
+if [ -d "/backup/vault/audit" ]; then
+    BACKUP_COUNT=$(ls /backup/vault/audit/ | wc -l)
+    echo "   ✓ Backup directory exists with $BACKUP_COUNT backups"
+else
+    echo "   ⚠ Backup directory not found"
+fi
+
+echo "=== Validation Complete ==="
+EOF
+
+chmod +x validate_audit_config.sh
+./validate_audit_config.sh
+Conclusion
+In this comprehensive lab, you have successfully:
+
+Installed and configured HashiCorp Vault with proper audit logging capabilities
+Enabled multiple audit devices including file and syslog audit mechanisms
+Generated various types of audit events through authentication, authorization, and secret operations
+Analyzed audit logs to identify patterns, security events, and user activities
+Implemented advanced audit management including log rotation, backup, and real-time monitoring
+Created compliance reporting tools for regulatory and security requirements
+Applied security best practices for audit log protection and integrity
+Why This Matters:
+
+Audit logging is a critical component of any secure system, and Vault's comprehensive audit capabilities provide:
+
+Compliance Support: Meet regulatory requirements for access logging and monitoring
+Security Monitoring: Detect unauthorized access attempts and policy violations
+Forensic Analysis: Investigate security incidents with detailed event trails
+Operational Insights: Understand usage patterns and optimize access policies
+Accountability: Track all actions to specific users and time periods
+The skills you've developed in this lab are essential for maintaining secure, compliant, and well-monitored Vault deployments in production environments. Regular audit log analysis and proper audit configuration are fundamental practices for any organization using HashiCorp Vault to manage sensitive data and secrets.
+
+Remember to regularly review your audit logs, maintain proper backup procedures, and keep your audit analysis tools updated to ensure ongoing security and compliance in your Vault infrastructure.
