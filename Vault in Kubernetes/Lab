@@ -1,0 +1,589 @@
+Vault in Kubernetes
+Lab Objectives
+By the end of this lab, you will be able to:
+
+Install and configure HashiCorp Vault on Kubernetes
+Set up Kubernetes authentication for Vault
+Configure Vault to inject secrets into Kubernetes pods
+Deploy applications that consume secrets from Vault
+Understand the security benefits of using Vault for secret management in Kubernetes
+Troubleshoot common Vault-Kubernetes integration issues
+Prerequisites
+Before starting this lab, you should have:
+
+Basic understanding of Kubernetes concepts (pods, services, deployments)
+Familiarity with YAML configuration files
+Basic knowledge of Linux command line operations
+Understanding of container concepts and Docker
+Basic knowledge of secret management concepts
+Lab Environment
+Al Nafi provides Linux-based cloud machines for this lab. Simply click Start Lab to access your dedicated Linux machine. The provided machine is bare metal with no pre-installed tools, so you will install all required components during the lab exercises.
+
+Task 1: Environment Setup and Tool Installation
+Subtask 1.1: Install Docker
+First, we need to install Docker to run containers.
+
+# Update the package index
+sudo apt update
+
+# Install required packages
+sudo apt install -y apt-transport-https ca-certificates curl gnupg lsb-release
+
+# Add Docker's official GPG key
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+
+# Set up the stable repository
+echo "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+# Update package index again
+sudo apt update
+
+# Install Docker Engine
+sudo apt install -y docker-ce docker-ce-cli containerd.io
+
+# Add current user to docker group
+sudo usermod -aG docker $USER
+
+# Start and enable Docker service
+sudo systemctl start docker
+sudo systemctl enable docker
+Log out and log back in for the group changes to take effect, or run:
+
+newgrp docker
+Verify Docker installation:
+
+docker --version
+docker run hello-world
+Subtask 1.2: Install kubectl
+Install the Kubernetes command-line tool:
+
+# Download kubectl
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+
+# Make kubectl executable
+chmod +x kubectl
+
+# Move kubectl to PATH
+sudo mv kubectl /usr/local/bin/
+
+# Verify installation
+kubectl version --client
+Subtask 1.3: Install kind (Kubernetes in Docker)
+We'll use kind to create a local Kubernetes cluster:
+
+# Download kind
+curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+
+# Make kind executable
+chmod +x ./kind
+
+# Move kind to PATH
+sudo mv ./kind /usr/local/bin/kind
+
+# Verify installation
+kind version
+Subtask 1.4: Install Helm
+Helm will help us install Vault on Kubernetes:
+
+# Download Helm installation script
+curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+# Verify installation
+helm version
+Subtask 1.5: Create Kubernetes Cluster
+Create a local Kubernetes cluster using kind:
+
+# Create cluster configuration file
+cat << EOF > kind-config.yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane
+  kubeadmConfigPatches:
+  - |
+    kind: InitConfiguration
+    nodeRegistration:
+      kubeletExtraArgs:
+        node-labels: "ingress-ready=true"
+  extraPortMappings:
+  - containerPort: 80
+    hostPort: 80
+    protocol: TCP
+  - containerPort: 443
+    hostPort: 443
+    protocol: TCP
+  - containerPort: 8200
+    hostPort: 8200
+    protocol: TCP
+EOF
+
+# Create the cluster
+kind create cluster --config=kind-config.yaml --name vault-lab
+
+# Verify cluster is running
+kubectl cluster-info
+kubectl get nodes
+Task 2: Install and Configure Vault on Kubernetes
+Subtask 2.1: Add Vault Helm Repository
+# Add HashiCorp Helm repository
+helm repo add hashicorp https://helm.releases.hashicorp.com
+
+# Update Helm repositories
+helm repo update
+
+# Verify repository is added
+helm search repo hashicorp/vault
+Subtask 2.2: Create Vault Configuration
+Create a custom values file for Vault installation:
+
+cat << EOF > vault-values.yaml
+server:
+  dev:
+    enabled: true
+    devRootToken: "root"
+  
+  standalone:
+    enabled: false
+  
+  ha:
+    enabled: false
+  
+  service:
+    type: NodePort
+    nodePort: 30200
+  
+  dataStorage:
+    enabled: false
+
+injector:
+  enabled: true
+  
+ui:
+  enabled: true
+  serviceType: NodePort
+  serviceNodePort: 30201
+EOF
+Subtask 2.3: Install Vault
+# Create namespace for Vault
+kubectl create namespace vault
+
+# Install Vault using Helm
+helm install vault hashicorp/vault --namespace vault --values vault-values.yaml
+
+# Wait for Vault pods to be ready
+kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=vault --namespace vault --timeout=300s
+
+# Check Vault installation
+kubectl get pods -n vault
+kubectl get services -n vault
+Subtask 2.4: Verify Vault Installation
+# Check if Vault is running
+kubectl logs -n vault vault-0
+
+# Port forward to access Vault UI (run in background)
+kubectl port-forward -n vault service/vault-ui 8200:8200 &
+
+# Test Vault API
+sleep 5
+curl -s http://localhost:8200/v1/sys/health | jq .
+If jq is not installed, install it:
+
+sudo apt install -y jq
+Task 3: Configure Kubernetes Authentication for Vault
+Subtask 3.1: Enable Kubernetes Auth Method
+# Set Vault address
+export VAULT_ADDR='http://localhost:8200'
+export VAULT_TOKEN='root'
+
+# Enable Kubernetes authentication
+kubectl exec -n vault vault-0 -- vault auth enable kubernetes
+
+# Get Kubernetes cluster information
+KUBERNETES_HOST=$(kubectl config view --raw --minify --flatten --output='jsonpath={.clusters[].cluster.server}')
+echo "Kubernetes Host: $KUBERNETES_HOST"
+
+# Get service account token (for newer Kubernetes versions)
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vault-auth-secret
+  namespace: vault
+  annotations:
+    kubernetes.io/service-account.name: vault
+type: kubernetes.io/service-account-token
+EOF
+
+# Get the token
+TOKEN_REVIEW_JWT=$(kubectl get secret vault-auth-secret -n vault -o jsonpath='{.data.token}' | base64 --decode)
+
+# Get Kubernetes CA certificate
+KUBERNETES_CA_CERT=$(kubectl config view --raw --minify --flatten --output='jsonpath={.clusters[].cluster.certificate-authority-data}' | base64 --decode)
+Subtask 3.2: Configure Kubernetes Auth Method
+# Configure Kubernetes authentication in Vault
+kubectl exec -n vault vault-0 -- vault write auth/kubernetes/config \
+    token_reviewer_jwt="$TOKEN_REVIEW_JWT" \
+    kubernetes_host="$KUBERNETES_HOST" \
+    kubernetes_ca_cert="$KUBERNETES_CA_CERT"
+
+# Verify configuration
+kubectl exec -n vault vault-0 -- vault read auth/kubernetes/config
+Subtask 3.3: Create Vault Policy and Role
+# Create a policy for our application
+kubectl exec -n vault vault-0 -- vault policy write myapp-policy - <<EOF
+path "secret/data/myapp/*" {
+  capabilities = ["read"]
+}
+EOF
+
+# Create a Kubernetes role
+kubectl exec -n vault vault-0 -- vault write auth/kubernetes/role/myapp \
+    bound_service_account_names=myapp-sa \
+    bound_service_account_namespaces=default \
+    policies=myapp-policy \
+    ttl=24h
+Task 4: Configure Secret Injection into Pods
+Subtask 4.1: Enable KV Secrets Engine and Create Secrets
+# Enable KV secrets engine
+kubectl exec -n vault vault-0 -- vault secrets enable -path=secret kv-v2
+
+# Create some test secrets
+kubectl exec -n vault vault-0 -- vault kv put secret/myapp/config \
+    username="myuser" \
+    password="mypassword" \
+    database_url="postgresql://localhost:5432/mydb"
+
+# Create additional secrets
+kubectl exec -n vault vault-0 -- vault kv put secret/myapp/api \
+    api_key="abc123xyz789" \
+    api_secret="secret123"
+
+# Verify secrets are created
+kubectl exec -n vault vault-0 -- vault kv get secret/myapp/config
+kubectl exec -n vault vault-0 -- vault kv get secret/myapp/api
+Subtask 4.2: Create Service Account
+# Create service account for our application
+kubectl create serviceaccount myapp-sa
+
+# Verify service account creation
+kubectl get serviceaccounts myapp-sa
+Subtask 4.3: Create Application with Vault Agent Injector
+Create a deployment that uses Vault's agent injector to retrieve secrets:
+
+cat << EOF > myapp-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp
+  labels:
+    app: myapp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: myapp
+  template:
+    metadata:
+      labels:
+        app: myapp
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "myapp"
+        vault.hashicorp.com/agent-inject-secret-config: "secret/data/myapp/config"
+        vault.hashicorp.com/agent-inject-secret-api: "secret/data/myapp/api"
+        vault.hashicorp.com/agent-inject-template-config: |
+          {{- with secret "secret/data/myapp/config" -}}
+          export USERNAME="{{ .Data.data.username }}"
+          export PASSWORD="{{ .Data.data.password }}"
+          export DATABASE_URL="{{ .Data.data.database_url }}"
+          {{- end }}
+        vault.hashicorp.com/agent-inject-template-api: |
+          {{- with secret "secret/data/myapp/api" -}}
+          {
+            "api_key": "{{ .Data.data.api_key }}",
+            "api_secret": "{{ .Data.data.api_secret }}"
+          }
+          {{- end }}
+    spec:
+      serviceAccountName: myapp-sa
+      containers:
+      - name: myapp
+        image: nginx:latest
+        ports:
+        - containerPort: 80
+        command: ["/bin/sh"]
+        args: ["-c", "while true; do echo 'App running...'; sleep 30; done"]
+EOF
+
+# Deploy the application
+kubectl apply -f myapp-deployment.yaml
+
+# Wait for deployment to be ready
+kubectl wait --for=condition=available --timeout=300s deployment/myapp
+
+# Check pod status
+kubectl get pods -l app=myapp
+Task 5: Test Secret Access in Kubernetes
+Subtask 5.1: Verify Secret Injection
+# Get the pod name
+POD_NAME=$(kubectl get pods -l app=myapp -o jsonpath='{.items[0].metadata.name}')
+echo "Pod name: $POD_NAME"
+
+# Check if secrets are injected
+kubectl exec $POD_NAME -- ls -la /vault/secrets/
+
+# View the injected config file
+echo "=== Config file content ==="
+kubectl exec $POD_NAME -- cat /vault/secrets/config
+
+# View the injected API file
+echo "=== API file content ==="
+kubectl exec $POD_NAME -- cat /vault/secrets/api
+Subtask 5.2: Test Secret Updates
+# Update secrets in Vault
+kubectl exec -n vault vault-0 -- vault kv put secret/myapp/config \
+    username="updateduser" \
+    password="updatedpassword" \
+    database_url="postgresql://newhost:5432/newdb"
+
+# Restart the pod to get updated secrets
+kubectl delete pod $POD_NAME
+
+# Wait for new pod to be ready
+kubectl wait --for=condition=ready pod -l app=myapp --timeout=300s
+
+# Get new pod name
+NEW_POD_NAME=$(kubectl get pods -l app=myapp -o jsonpath='{.items[0].metadata.name}')
+echo "New pod name: $NEW_POD_NAME"
+
+# Verify updated secrets
+echo "=== Updated config file content ==="
+kubectl exec $NEW_POD_NAME -- cat /vault/secrets/config
+Subtask 5.3: Create a More Complex Application
+Create an application that actually uses the secrets:
+
+cat << EOF > webapp-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webapp
+  labels:
+    app: webapp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: webapp
+  template:
+    metadata:
+      labels:
+        app: webapp
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "myapp"
+        vault.hashicorp.com/agent-inject-secret-env: "secret/data/myapp/config"
+        vault.hashicorp.com/agent-inject-template-env: |
+          {{- with secret "secret/data/myapp/config" -}}
+          USERNAME="{{ .Data.data.username }}"
+          PASSWORD="{{ .Data.data.password }}"
+          DATABASE_URL="{{ .Data.data.database_url }}"
+          {{- end }}
+    spec:
+      serviceAccountName: myapp-sa
+      containers:
+      - name: webapp
+        image: busybox:latest
+        command: ["/bin/sh"]
+        args: 
+        - -c
+        - |
+          echo "Starting web application..."
+          while true; do
+            echo "=== Current Time: $(date) ==="
+            if [ -f /vault/secrets/env ]; then
+              echo "=== Loading secrets from Vault ==="
+              source /vault/secrets/env
+              echo "Username: $USERNAME"
+              echo "Database URL: $DATABASE_URL"
+              echo "Password: [HIDDEN]"
+            else
+              echo "No secrets file found!"
+            fi
+            echo "=== Application running ==="
+            sleep 60
+          done
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: webapp-service
+spec:
+  selector:
+    app: webapp
+  ports:
+  - port: 80
+    targetPort: 80
+  type: ClusterIP
+EOF
+
+# Deploy the web application
+kubectl apply -f webapp-deployment.yaml
+
+# Wait for deployment
+kubectl wait --for=condition=available --timeout=300s deployment/webapp
+
+# Check the application logs
+WEBAPP_POD=$(kubectl get pods -l app=webapp -o jsonpath='{.items[0].metadata.name}')
+kubectl logs $WEBAPP_POD --tail=20
+Subtask 5.4: Test Different Secret Formats
+Create secrets in different formats:
+
+# Create JSON formatted secrets
+kubectl exec -n vault vault-0 -- vault kv put secret/myapp/json-config \
+    config='{"host":"localhost","port":5432,"ssl":true}'
+
+# Create a deployment that uses JSON secrets
+cat << EOF > json-app-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: json-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: json-app
+  template:
+    metadata:
+      labels:
+        app: json-app
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "myapp"
+        vault.hashicorp.com/agent-inject-secret-config.json: "secret/data/myapp/json-config"
+        vault.hashicorp.com/agent-inject-template-config.json: |
+          {{- with secret "secret/data/myapp/json-config" -}}
+          {{ .Data.data.config }}
+          {{- end }}
+    spec:
+      serviceAccountName: myapp-sa
+      containers:
+      - name: json-app
+        image: busybox:latest
+        command: ["/bin/sh"]
+        args: ["-c", "while true; do echo 'JSON App running...'; cat /vault/secrets/config.json; sleep 60; done"]
+EOF
+
+# Deploy JSON application
+kubectl apply -f json-app-deployment.yaml
+
+# Wait and check logs
+kubectl wait --for=condition=available --timeout=300s deployment/json-app
+JSON_POD=$(kubectl get pods -l app=json-app -o jsonpath='{.items[0].metadata.name}')
+kubectl logs $JSON_POD --tail=10
+Task 6: Advanced Configuration and Troubleshooting
+Subtask 6.1: Monitor Vault Agent Injector
+# Check Vault agent injector logs
+kubectl logs -n vault -l app.kubernetes.io/name=vault-agent-injector
+
+# Check Vault server logs
+kubectl logs -n vault vault-0
+
+# Check the status of all Vault components
+kubectl get all -n vault
+Subtask 6.2: Verify Authentication and Authorization
+# Test authentication directly
+kubectl exec -n vault vault-0 -- vault write auth/kubernetes/login \
+    role=myapp \
+    jwt="$(kubectl get secret vault-auth-secret -n vault -o jsonpath='{.data.token}' | base64 --decode)"
+
+# List all authentication methods
+kubectl exec -n vault vault-0 -- vault auth list
+
+# List all policies
+kubectl exec -n vault vault-0 -- vault policy list
+
+# Read the myapp policy
+kubectl exec -n vault vault-0 -- vault policy read myapp-policy
+Subtask 6.3: Common Troubleshooting Steps
+# Check if pods have the correct annotations
+kubectl describe pod $POD_NAME | grep -A 10 Annotations
+
+# Check if service account exists and has proper permissions
+kubectl get serviceaccount myapp-sa -o yaml
+
+# Verify Vault is accessible from within the cluster
+kubectl run vault-test --image=busybox:latest --rm -it --restart=Never -- \
+  wget -qO- http://vault.vault.svc.cluster.local:8200/v1/sys/health
+
+# Check Vault agent injector webhook configuration
+kubectl get mutatingwebhookconfiguration vault-agent-injector-cfg -o yaml
+Subtask 6.4: Clean Up Test Resources
+# Delete test deployments
+kubectl delete deployment myapp webapp json-app
+
+# Delete service account
+kubectl delete serviceaccount myapp-sa
+
+# Clean up configuration files
+rm -f kind-config.yaml vault-values.yaml myapp-deployment.yaml webapp-deployment.yaml json-app-deployment.yaml
+Troubleshooting Common Issues
+Issue 1: Pod Fails to Start with Vault Annotations
+Symptoms: Pod remains in Init:0/1 or Init:Error state
+
+Solutions:
+
+# Check init container logs
+kubectl logs $POD_NAME -c vault-agent-init
+
+# Verify service account has correct permissions
+kubectl describe serviceaccount myapp-sa
+
+# Check if Vault role exists
+kubectl exec -n vault vault-0 -- vault read auth/kubernetes/role/myapp
+Issue 2: Secrets Not Appearing in Pod
+Symptoms: /vault/secrets/ directory is empty
+
+Solutions:
+
+# Verify Vault policy allows reading secrets
+kubectl exec -n vault vault-0 -- vault policy read myapp-policy
+
+# Check if secrets exist in Vault
+kubectl exec -n vault vault-0 -- vault kv get secret/myapp/config
+
+# Verify annotation syntax in deployment
+kubectl get pod $POD_NAME -o yaml | grep -A 20 annotations
+Issue 3: Authentication Failures
+Symptoms: Vault agent cannot authenticate
+
+Solutions:
+
+# Check Kubernetes auth configuration
+kubectl exec -n vault vault-0 -- vault read auth/kubernetes/config
+
+# Verify service account token
+kubectl get secret vault-auth-secret -n vault -o yaml
+
+# Test manual authentication
+kubectl exec -n vault vault-0 -- vault write auth/kubernetes/login role=myapp jwt="$(kubectl get secret vault-auth-secret -n vault -o jsonpath='{.data.token}' | base64 --decode)"
+Conclusion
+In this lab, you have successfully:
+
+Set up a complete Kubernetes environment with kind, including Docker, kubectl, and Helm
+Installed HashiCorp Vault on Kubernetes using Helm charts with proper configuration
+Configured Kubernetes authentication for Vault, enabling secure communication between Kubernetes and Vault
+Implemented secret injection using Vault Agent Injector to automatically provide secrets to pods
+Created and deployed applications that consume secrets from Vault in various formats
+Tested secret updates and rotation to understand how applications receive updated credentials
+Learned troubleshooting techniques for common Vault-Kubernetes integration issues
+This integration provides several important benefits:
+
+Enhanced Security: Secrets are never stored in Kubernetes etcd or container images
+Dynamic Secret Management: Secrets can be rotated and updated without rebuilding applications
+Centralized Secret Storage: All secrets are managed in one secure location
+Audit Trail: Vault provides comprehensive logging of secret access
+Fine-grained Access Control: Policies ensure applications only access necessary secrets
+The skills you've learned in this lab are essential for implementing secure secret management in production Kubernetes environments. Vault's integration with Kubernetes provides a robust foundation for managing sensitive data in containerized applications while maintaining security best practices.
+
+Understanding this integration is crucial for DevOps engineers and security professionals working with modern containerized applications, as it addresses one of the most critical aspects of application security: protecting sensitive configuration data and credentials.
