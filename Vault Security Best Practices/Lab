@@ -1,0 +1,375 @@
+Vault Security Best Practices
+Lab Objectives
+By the end of this lab, students will be able to:
+
+Install and initialize HashiCorp Vault with a hardened configuration
+Implement Vault access control policies (ACL) for different user roles
+Authenticate using both the userpass and AppRole authentication methods
+Enable and validate audit logging and the transit encryption engine
+Run a scripted security test suite to validate a Vault deployment
+Prerequisites
+Before starting this lab, students should have:
+
+Basic understanding of Linux command line operations
+Familiarity with JSON and HCL (HashiCorp Configuration Language) syntax
+Understanding of basic cryptographic concepts (encryption, certificates)
+Experience with a text editor such as nano or vim
+This lab is intended to be performed on a single, self-owned or lab-provisioned Linux VM (Ubuntu/Debian-based) that you are authorized to configure. No pre-installed tools are required; all software is installed during the lab.
+
+Install commands used later in this lab (for reference, executed in Task 1):
+
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y wget unzip curl gpg openssl
+Task 1: Install, Configure, and Initialize Vault
+Subtask 1.1: Install Vault
+# Update system packages
+sudo apt update && sudo apt upgrade -y
+
+# Install required dependencies
+sudo apt install -y wget unzip curl gpg openssl
+
+# Add HashiCorp GPG key and repository
+wget -O- https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+
+# Install Vault
+sudo apt update
+sudo apt install -y vault
+
+# Verify installation
+vault version
+Subtask 1.2: Create Directories and a Dedicated User
+sudo mkdir -p /etc/vault.d /opt/vault/data /var/log/vault /var/log/vault/audit
+
+# Create a system user for Vault
+sudo useradd --system --home /etc/vault.d --shell /bin/false vault || echo "user already exists"
+
+sudo chown -R vault:vault /etc/vault.d /opt/vault/data /var/log/vault
+Subtask 1.3: Generate TLS Certificates
+sudo openssl genrsa -out /etc/vault.d/vault-key.pem 2048
+
+sudo openssl req -new -key /etc/vault.d/vault-key.pem -out /etc/vault.d/vault.csr \
+  -subj "/C=US/ST=State/L=City/O=Organization/CN=localhost"
+
+sudo openssl x509 -req -in /etc/vault.d/vault.csr -signkey /etc/vault.d/vault-key.pem \
+  -out /etc/vault.d/vault-cert.pem -days 365
+
+sudo chown vault:vault /etc/vault.d/vault-key.pem /etc/vault.d/vault-cert.pem
+sudo chmod 600 /etc/vault.d/vault-key.pem
+sudo chmod 644 /etc/vault.d/vault-cert.pem
+sudo rm /etc/vault.d/vault.csr
+Subtask 1.4: Write the Vault Configuration File
+sudo tee /etc/vault.d/vault.hcl > /dev/null << 'EOF'
+storage "file" {
+  path = "/opt/vault/data"
+}
+
+listener "tcp" {
+  address       = "127.0.0.1:8200"
+  tls_disable   = false
+  tls_cert_file = "/etc/vault.d/vault-cert.pem"
+  tls_key_file  = "/etc/vault.d/vault-key.pem"
+}
+
+api_addr     = "https://127.0.0.1:8200"
+cluster_addr = "https://127.0.0.1:8201"
+
+ui = true
+disable_mlock = true
+log_level = "INFO"
+log_file  = "/var/log/vault/vault.log"
+EOF
+
+sudo chown vault:vault /etc/vault.d/vault.hcl
+Subtask 1.5: Create the Systemd Service
+sudo tee /etc/systemd/system/vault.service > /dev/null << 'EOF'
+[Unit]
+Description=HashiCorp Vault
+Documentation=https://www.vaultproject.io/docs/
+Requires=network-online.target
+After=network-online.target
+ConditionFileNotEmpty=/etc/vault.d/vault.hcl
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=notify
+User=vault
+Group=vault
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+SecureBits=keep-caps
+AmbientCapabilities=CAP_IPC_LOCK
+CapabilityBoundingSet=CAP_SYSLOG CAP_IPC_LOCK
+NoNewPrivileges=yes
+ExecStart=/usr/bin/vault server -config=/etc/vault.d/vault.hcl
+ExecReload=/bin/kill --signal HUP $MAINPID
+KillMode=process
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable vault
+sudo systemctl start vault
+sudo systemctl status vault --no-pager
+Subtask 1.6: Initialize and Unseal Vault
+export VAULT_ADDR='https://127.0.0.1:8200'
+export VAULT_SKIP_VERIFY=true   # only acceptable for self-signed certs in this isolated lab
+
+# Initialize Vault (writes unseal keys and root token to a local file)
+vault operator init -key-shares=5 -key-threshold=3 > /tmp/vault-init.txt
+cat /tmp/vault-init.txt
+Save the unseal keys and root token shown in the output. Create a reusable unseal helper script:
+
+cat > /tmp/unseal-vault.sh << 'EOF'
+#!/bin/bash
+# Unseals Vault using the keys stored in /tmp/vault-init.txt.
+# For demonstration only: in production use auto-unseal via a cloud KMS.
+
+export VAULT_ADDR='https://127.0.0.1:8200'
+export VAULT_SKIP_VERIFY=true
+
+UNSEAL_KEY_1=$(grep 'Unseal Key 1:' /tmp/vault-init.txt | awk '{print $NF}')
+UNSEAL_KEY_2=$(grep 'Unseal Key 2:' /tmp/vault-init.txt | awk '{print $NF}')
+UNSEAL_KEY_3=$(grep 'Unseal Key 3:' /tmp/vault-init.txt | awk '{print $NF}')
+
+if vault status 2>/dev/null | grep -q "Sealed.*true"; then
+    echo "Vault is sealed. Unsealing..."
+    vault operator unseal "$UNSEAL_KEY_1"
+    vault operator unseal "$UNSEAL_KEY_2"
+    vault operator unseal "$UNSEAL_KEY_3"
+    echo "Vault unsealed."
+else
+    echo "Vault is already unsealed (or unreachable)."
+fi
+
+export ROOT_TOKEN=$(grep 'Initial Root Token:' /tmp/vault-init.txt | awk '{print $NF}')
+vault login -no-print "$ROOT_TOKEN"
+echo "Logged in with root token."
+EOF
+
+chmod +x /tmp/unseal-vault.sh
+/tmp/unseal-vault.sh
+
+# Re-export the root token in the current shell for subsequent commands
+export ROOT_TOKEN=$(grep 'Initial Root Token:' /tmp/vault-init.txt | awk '{print $NF}')
+export VAULT_TOKEN=$ROOT_TOKEN
+
+vault status
+Deliverable: vault status shows Sealed: false and Initialized: true. You have a running Vault instance, saved unseal keys/root token in /tmp/vault-init.txt, and a reusable /tmp/unseal-vault.sh script.
+
+Task 2: Access Control Policies and Authentication Methods
+Subtask 2.1: Create Policies
+# Admin policy - full access
+cat > /tmp/admin-policy.hcl << 'EOF'
+path "*" {
+  capabilities = ["create", "read", "update", "delete", "list", "sudo"]
+}
+EOF
+
+# Web application policy - read-only on its own secrets
+cat > /tmp/webapp-policy.hcl << 'EOF'
+path "secret/data/webapp/*" {
+  capabilities = ["read"]
+}
+path "secret/metadata/webapp/*" {
+  capabilities = ["list"]
+}
+path "auth/token/renew-self" {
+  capabilities = ["update"]
+}
+path "auth/token/lookup-self" {
+  capabilities = ["read"]
+}
+EOF
+
+# Developer policy - full access to dev secrets, read-only on shared secrets
+cat > /tmp/developer-policy.hcl << 'EOF'
+path "secret/data/dev/*" {
+  capabilities = ["create", "read", "update", "delete"]
+}
+path "secret/metadata/dev/*" {
+  capabilities = ["list"]
+}
+path "secret/data/shared/*" {
+  capabilities = ["read"]
+}
+path "auth/token/renew-self" {
+  capabilities = ["update"]
+}
+path "auth/token/lookup-self" {
+  capabilities = ["read"]
+}
+EOF
+
+vault policy write admin /tmp/admin-policy.hcl
+vault policy write webapp /tmp/webapp-policy.hcl
+vault policy write developer /tmp/developer-policy.hcl
+
+vault policy list
+Subtask 2.2: Enable Authentication Methods and Create Users
+vault auth enable userpass
+vault auth enable approle
+vault auth list
+
+# Users
+vault write auth/userpass/users/alice password=alice123 policies=developer
+vault write auth/userpass/users/bob   password=bob123   policies=webapp
+
+# Enable KV v2 at the default secret/ mount (required before writing secrets below)
+vault secrets enable -path=secret -version=2 kv
+Subtask 2.3: Create and Test an AppRole
+# Create an AppRole bound to the webapp policy
+vault write auth/approle/role/webapp-role \
+    token_policies="webapp" \
+    token_ttl=1h \
+    token_max_ttl=4h \
+    bind_secret_id=true
+
+# Retrieve the role-id
+ROLE_ID=$(vault read -field=role_id auth/approle/role/webapp-role/role-id)
+echo "Role ID: $ROLE_ID"
+
+# Generate a secret-id
+SECRET_ID=$(vault write -f -field=secret_id auth/approle/role/webapp-role/secret-id)
+echo "Secret ID: $SECRET_ID"
+
+# Authenticate using the AppRole credentials
+APPROLE_TOKEN=$(vault write -field=token auth/approle/login \
+    role_id="$ROLE_ID" \
+    secret_id="$SECRET_ID")
+
+echo "AppRole token: $APPROLE_TOKEN"
+
+# Confirm the resulting token carries the webapp policy
+VAULT_TOKEN=$APPROLE_TOKEN vault token lookup -format=json | grep -A3 policies
+Deliverable: the token lookup output for $APPROLE_TOKEN lists "webapp" (and "default") in its policies, proving the AppRole login succeeded and is correctly scoped.
+
+Subtask 2.4: Test User Policies
+# Log in as alice (developer) and bob (webapp)
+ALICE_TOKEN=$(vault write -field=token auth/userpass/login/alice password=alice123)
+BOB_TOKEN=$(vault write -field=token auth/userpass/login/bob password=bob123)
+
+# Alice can write/read dev secrets
+VAULT_TOKEN=$ALICE_TOKEN vault kv put secret/dev/app-config username=devuser password=devpass
+VAULT_TOKEN=$ALICE_TOKEN vault kv get secret/dev/app-config
+
+# Alice should NOT be able to write webapp secrets
+echo "Expect permission denied below:"
+VAULT_TOKEN=$ALICE_TOKEN vault kv put secret/webapp/config username=webuser password=webpass
+
+# Root token creates a webapp secret for Bob to read
+vault kv put secret/webapp/config username=webuser password=webpass
+
+# Bob can read webapp secrets
+VAULT_TOKEN=$BOB_TOKEN vault kv get secret/webapp/config
+
+# Bob should NOT be able to write new webapp secrets
+echo "Expect permission denied below:"
+VAULT_TOKEN=$BOB_TOKEN vault kv put secret/webapp/newconfig test=value
+Deliverable: Alice's write to secret/webapp/config and Bob's write to secret/webapp/newconfig both return a permission denied error from Vault, while Alice's dev-secret operations and Bob's webapp read succeed. This confirms policy enforcement is working as intended.
+
+Task 3: Audit Logging and Transit Encryption
+Subtask 3.1: Enable Audit Logging
+sudo mkdir -p /var/log/vault/audit
+sudo chown vault:vault /var/log/vault/audit
+
+vault audit enable file file_path=/var/log/vault/audit/vault-audit.log
+vault audit list
+Subtask 3.2: Generate and Inspect Audit Events
+vault kv put secret/dev/audit-test data=test-value
+vault kv get secret/dev/audit-test
+vault kv delete secret/dev/audit-test
+
+# Each line is a JSON object; pretty-print the most recent entries
+sudo tail -5 /var/log/vault/audit/vault-audit.log | python3 -m json.tool 2>/dev/null || \
+  sudo tail -5 /var/log/vault/audit/vault-audit.log
+Deliverable: /var/log/vault/audit/vault-audit.log contains JSON entries with a "type" field (request or response) and a nested "request" object showing the secret/data/dev/audit-test path, confirming audit logging captures real Vault operations.
+
+Subtask 3.3: Configure the Transit Encryption Engine
+vault secrets enable transit
+vault write -f transit/keys/webapp-key
+
+# Encrypt data
+CIPHERTEXT=$(echo -n "sensitive data" | base64 | vault write -field=ciphertext transit/encrypt/webapp-key plaintext=-)
+echo "Ciphertext: $CIPHERTEXT"
+
+# Decrypt data
+vault write -field=plaintext transit/decrypt/webapp-key ciphertext="$CIPHERTEXT" | base64 -d
+echo
+Subtask 3.4: Rotate the Encryption Key
+vault write -f transit/keys/webapp-key/rotate
+vault read transit/keys/webapp-key
+
+# Confirm the previous ciphertext still decrypts correctly after rotation
+vault write -field=plaintext transit/decrypt/webapp-key ciphertext="$CIPHERTEXT" | base64 -d
+echo
+Deliverable: the decrypted output after rotation still reads sensitive data, demonstrating that Vault retains prior key versions and can decrypt data encrypted before rotation.
+
+Subtask 3.5: Apply a Hardened Configuration and Reconnect
+sudo cp /etc/vault.d/vault.hcl /etc/vault.d/vault.hcl.backup
+
+cat > /tmp/vault-secure.hcl << 'EOF'
+storage "file" {
+  path = "/opt/vault/data"
+}
+
+listener "tcp" {
+  address           = "127.0.0.1:8200"
+  tls_disable       = false
+  tls_cert_file     = "/etc/vault.d/vault-cert.pem"
+  tls_key_file      = "/etc/vault.d/vault-key.pem"
+  tls_min_version   = "tls12"
+  tls_cipher_suites = "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"
+}
+
+api_addr     = "https://127.0.0.1:8200"
+cluster_addr = "https://127.0.0.1:8201"
+
+ui = true
+disable_mlock = true
+log_level = "INFO"
+log_file  = "/var/log/vault/vault.log"
+
+default_lease_ttl = "1h"
+max_lease_ttl     = "24h"
+EOF
+
+sudo cp /tmp/vault-secure.hcl /etc/vault.d/vault.hcl
+sudo chown vault:vault /etc/vault.d/vault.hcl
+
+sudo systemctl restart vault
+
+# Wait for Vault to accept connections before proceeding
+until vault status > /dev/null 2>&1; do
+  echo "Waiting for Vault to start..."
+  sleep 2
+done
+
+# A restart reseals Vault and any previous VAULT_TOKEN session is no longer valid
+# against a sealed backend. Unseal and re-authenticate before continuing.
+/tmp/unseal-vault.sh
+export ROOT_TOKEN=$(grep 'Initial Root Token:' /tmp/vault-init.txt | awk '{print $NF}')
+export VAULT_TOKEN=$ROOT_TOKEN
+
+vault status
+Deliverable: after the restart, vault status reports Sealed: false, and a follow-up command such as vault policy list succeeds using the re-exported VAULT_TOKEN, confirming the session was correctly re-established.
+
+Expected Outcomes
+A running, TLS-enabled Vault instance with file-based audit logging enabled and generating real JSON audit entries
+Distinct policies (admin, webapp, developer) correctly enforced for both userpass users and an AppRole-authenticated client
+Working transit encryption with demonstrated key rotation and backward-compatible decryption
+Troubleshooting
+Symptom: Commands fail with Error checking seal status: Get "https://127.0.0.1:8200/v1/sys/seal-status": dial tcp ... connect: connection refused. Diagnostic hint: check sudo systemctl status vault --no-pager and sudo journalctl -u vault -n 50 to see if the service failed to start, often due to a config syntax error in /etc/vault.d/vault.hcl.
+Symptom: A previously working vault command suddenly returns permission denied or * missing client token. Diagnostic hint: check whether Vault was restarted (which reseals it) or whether VAULT_TOKEN is still exported in your current shell session; re-run /tmp/unseal-vault.sh and re-export VAULT_TOKEN.
+Conclusion
+In this lab you deployed HashiCorp Vault with TLS enabled, initialized and unsealed it, and built a layered access-control model using both static users (userpass) and machine-oriented authentication (AppRole), verifying in each case that policies were actually enforced rather than just defined. You also enabled audit logging and inspected real audit entries, configured the transit secrets engine for encryption-as-a-service, and practiced key rotation while confirming backward compatibility with previously encrypted data. Finally, you experienced firsthand a common operational pitfall â that restarting Vault reseals it and invalidates in-shell sessions â and practiced the correct recovery procedure of unsealing and re-authenticating. These skills directly translate to operating production Vault clusters securely: enforcing least-privilege policies, verifying authentication boundaries before trusting them, and building repeatable scripts for unsealing, backup, and health checks rather than relying on manual, error-prone steps.
